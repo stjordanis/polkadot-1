@@ -1,4 +1,5 @@
 use crate::Priority;
+use super::worker;
 use std::{
 	mem,
 	path::Path,
@@ -7,6 +8,7 @@ use std::{
 	task::{Context, Poll},
 };
 use async_std::path::PathBuf;
+use futures::{future::BoxFuture, stream::FuturesUnordered};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WorkerId(pub usize);
@@ -20,9 +22,9 @@ pub trait Pool {
 	/// TODO: Rename to something like: "set background priority"
 	fn set_priority(&self, worker_id: WorkerId, priority: bool);
 
-	/// Return back the given worker.
-	// TODO: Rename to "offer_back", but also change the return type to "Option<WorkerId>"
-	fn put_back(&mut self, worker_id: WorkerId);
+	/// Offer the worker back to the pool. The passed worker ID must be considered unusable unless
+	/// it wasn't taken by the pool, in which case it will be returned as `Some`.
+	fn offer_back(&mut self, worker_id: WorkerId) -> Option<WorkerId>;
 
 	fn poll_next(&mut self, cx: &mut Context) -> Poll<PoolEvent>;
 }
@@ -78,7 +80,8 @@ impl Child {
 
 #[derive(Default)]
 struct RealPool {
-	actions: Vec<Action>,
+	tasks: FuturesUnordered<BoxFuture<'static, PoolEvent>>,
+
 	children: Vec<Child>,
 
 	/// The maximum number of workers this pool can ever host. This is expected to be a small
@@ -115,9 +118,13 @@ impl Pool for RealPool {
 			.enumerate()
 			.find(|(_, child)| child.is_free())
 		{
-			let worker_id = WorkerId(idx);
-			self.actions.push(Action::Spawn(worker_id));
 			child.reserve();
+			let worker_id = WorkerId(idx);
+			self.tasks.push(async move {
+				// TODO: What to do with an error?
+				let (idle_worker, child) = worker::spawn().await;
+
+			});
 			return Some(worker_id);
 		}
 
@@ -125,19 +132,7 @@ impl Pool for RealPool {
 	}
 
 	fn start_work(&mut self, worker_id: WorkerId, code: Arc<Vec<u8>>, artifact_path: PathBuf) {
-		// TODO: Kill on timeout.
-		// TODO: Submit a task that already encompasses a timeout?
-		self.actions
-			.push(Action::StartWork(worker_id, code, artifact_path));
 
-		//async move {
-			// take the stream and write there a command, i.e. the code and the artifact path.
-			// then wait for the response
-
-			// also get a delay for the deadline and select on those two.
-
-			// Return an event in the end?
-		//}
 		todo!()
 	}
 
@@ -147,12 +142,14 @@ impl Pool for RealPool {
 		}
 	}
 
-	fn put_back(&mut self, worker_id: WorkerId) {
+	fn offer_back(&mut self, worker_id: WorkerId) -> Option<WorkerId> {
 		// TODO: if we are over limit -> kill it
 		// we should probably also return a result so that the queue knows if it can reuse the
 		// worker.
 
 		// Should probably reset the priority to the default?
+
+		todo!()
 	}
 
 	// fn kill(&mut self, worker_id: WorkerId) {

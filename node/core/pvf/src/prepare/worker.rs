@@ -19,47 +19,58 @@ use async_std::prelude::*;
 use async_std::{
 	io,
 	os::unix::net::{UnixListener, UnixStream},
-	path::PathBuf,
+	path::{PathBuf, Path},
 };
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, StreamExt, channel::mpsc};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, FutureExt, StreamExt, channel::mpsc};
 use futures_timer::Delay;
 use std::{
 	mem,
-	path::Path,
 	pin::Pin,
 	sync::Arc,
 	task::{Context, Poll},
 	time::Duration,
 };
 
-pub struct AvailableWorker {
+pub struct IdleWorker {
+	/// The stream to which the child process is connected.
 	stream: UnixStream,
 }
 
-pub async fn spawn(socket_path: String) -> io::Result<AvailableWorker> {
-	let listener = UnixListener::bind(socket_path).await?;
-	let (mut stream, _) = listener.accept().await?;
+pub async fn spawn() -> io::Result<(IdleWorker, async_process::Child)> {
+	let socket_path = transient_socket_path();
+	let listener = UnixListener::bind(&socket_path).await?;
+	let child = spawn_child(socket_path).await;
 
-	Ok(AvailableWorker { stream })
+	// TODO: don't forget to kill the child should the following code fail
+
+	let (mut stream, _) = listener.accept().await?;
+	Ok((IdleWorker { stream }, child))
+}
+
+fn transient_socket_path() -> PathBuf {
+	let mut temp_dir = std::env::temp_dir();
+	temp_dir.push(format!("pvf-prepare-{}", "")); // TODO: see tempfile impl
+	todo!()
+}
+
+async fn spawn_child(socket_path: impl AsRef<Path>) -> async_process::Child {
+	todo!()
 }
 
 pub enum Outcome {
 	/// The worker has finished the work assigned to it.
-	Concluded(AvailableWorker),
+	Concluded(IdleWorker),
 	/// The execution was interrupted abruptly and the worker is not available anymore. For example,
 	/// this could've happen because the worker hadn't finished the work until the given deadline.
 	DidntMakeIt,
 }
 
 pub async fn start_work(
-	worker: AvailableWorker,
+	worker: IdleWorker,
 	code: Arc<Vec<u8>>,
 	artifact_path: PathBuf,
-	background_priority: bool,
-) -> io::Result<()> {
-	let AvailableWorker { stream } = worker;
-
-	// TODO: handle the priority stuff.
+) -> io::Result<Outcome> {
+	let IdleWorker { mut stream } = worker;
 
 	framed_write(&mut stream, &*code).await?;
 	framed_write(&mut stream, path_bytes(&artifact_path)).await?;
@@ -70,8 +81,6 @@ pub async fn start_work(
 	// In that case we should handle these gracefully by writing the artifact file by ourselves.
 	// We may potentially overwrite the artifact in rare cases where the worker didn't make
 	// it to report back the result.
-	let ack_read = framed_read(&mut stream);
-	let deadline = Delay::new(Duration::from_secs(3)); // TODO: const or configurable
 
 	enum Selected {
 		Read(io::Result<()>),
@@ -79,14 +88,14 @@ pub async fn start_work(
 	}
 
 	let selected = futures::select! {
-		ack_read = ack_read => Selected::Read(ack_read.map(|_| ())),
-		_ = deadline => Selected::Deadline,
+		ack_read = framed_read(&mut stream).fuse() => Selected::Read(ack_read.map(|_| ())),
+		_ = Delay::new(Duration::from_secs(3)).fuse() => Selected::Deadline,
 	};
 
 	// TODO: if deadline was reached or the error has happened then treat it as didn't make it.
 	// In any case of the error we must write the artifact path ourselves.
 
-	Ok(())
+	todo!()
 }
 
 /// Convert the given path into a byte buffer.
@@ -107,9 +116,9 @@ async fn framed_write(w: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> io::Resu
 }
 
 async fn framed_read(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
-	let len_buf = [0usize; mem::size_of::<usize>()];
+	let len_buf = [0u8; mem::size_of::<usize>()];
 	r.read_exact(&mut len_buf).await?;
-	let len = usize::from_le_bytes(&len_buf);
+	let len = usize::from_le_bytes(len_buf);
 	let mut buf = vec![0; len];
 	r.read_exact(&mut buf).await?;
 	Ok(buf)
