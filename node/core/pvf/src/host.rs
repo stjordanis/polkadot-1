@@ -22,7 +22,7 @@ use std::{
 use async_std::path::{Path, PathBuf};
 use crate::{Priority, Pvf, artifacts::ArtifactId, execute, prepare};
 use futures::{
-	FutureExt, StreamExt,
+	FutureExt, SinkExt, StreamExt,
 	channel::{mpsc, oneshot},
 	future::BoxFuture,
 	stream::FuturesUnordered,
@@ -52,7 +52,10 @@ enum FromHandle {
 
 struct Inner {
 	from_handle_rx: mpsc::Receiver<FromHandle>,
-	prepare_queue: prepare::Queue,
+
+	to_prepare_queue_tx: mpsc::Sender<prepare::ToQueue>,
+	from_prepare_queue_rx: mpsc::UnboundedReceiver<prepare::FromQueue>,
+
 	execute_pool: execute::Pool<()>,
 	artifacts: Artifacts,
 }
@@ -60,7 +63,7 @@ struct Inner {
 impl Inner {
 	async fn run(mut self) {
 		let mut from_handle_rx = self.from_handle_rx.fuse();
-		let mut prepare_queue = self.prepare_queue;
+		let mut prepare_queue = self.from_prepare_queue_rx.fuse();
 		let mut execute_pool = self.execute_pool;
 		let mut artifacts = self.artifacts;
 
@@ -69,13 +72,13 @@ impl Inner {
 				from_handle = from_handle_rx.select_next_some() => {
 					handle_from_handle(
 						&mut artifacts,
-						&mut prepare_queue,
+						&mut self.to_prepare_queue_tx,
 						&mut execute_pool,
 						from_handle,
 					)
 					.await;
 				},
-				artifact_id = prepare_queue.select_next_some() => {
+				prepare::FromQueue::Prepared(artifact_id) = prepare_queue.select_next_some() => {
 					// Note that preparation always succeeds.
 					//
 					// That's because the error conditions are written into the artifact and will be
@@ -99,7 +102,7 @@ impl Inner {
 
 async fn handle_from_handle(
 	artifacts: &mut Artifacts,
-	prepare_queue: &mut prepare::Queue,
+	prepare_queue: &mut mpsc::Sender<prepare::ToQueue>,
 	execute_pool: &mut execute::Pool<()>,
 	from_handle: FromHandle,
 ) {
@@ -129,7 +132,7 @@ async fn handle_from_handle(
 
 async fn handle_execute_pvf(
 	artifacts: &mut Artifacts,
-	prepare_queue: &mut prepare::Queue,
+	prepare_queue: &mut mpsc::Sender<prepare::ToQueue>,
 	execute_pool: &mut execute::Pool<()>,
 	pvf: Pvf,
 	params: Vec<u8>,
@@ -150,7 +153,10 @@ async fn handle_execute_pvf(
 			}
 		},
 		Entry::Vacant(v) => {
-			prepare_queue.enqueue(priority, pvf);
+			prepare_queue
+				.send(prepare::ToQueue::Enqueue { priority, pvf })
+				.await;
+
 			v.insert(ArtifactState::Preparing {
 				pending_requests: vec![PendingExecutionRequest { params, result_tx }],
 			});
@@ -160,7 +166,7 @@ async fn handle_execute_pvf(
 
 async fn handle_heads_up(
 	artifacts: &mut Artifacts,
-	prepare_queue: &mut prepare::Queue,
+	prepare_queue: &mut mpsc::Sender<prepare::ToQueue>,
 	active_pvfs: Vec<Pvf>,
 ) {
 	for active_pvf in active_pvfs {
@@ -171,7 +177,13 @@ async fn handle_heads_up(
 				v.insert(ArtifactState::Preparing {
 					pending_requests: vec![],
 				});
-				prepare_queue.enqueue(Priority::Background, active_pvf);
+
+				prepare_queue
+					.send(prepare::ToQueue::Enqueue {
+						priority: Priority::Background,
+						pvf: active_pvf,
+					})
+					.await;
 			}
 		}
 	}

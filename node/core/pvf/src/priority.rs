@@ -20,4 +20,8 @@ impl Priority {
 	pub fn is_critical(&self) -> bool {
 		*self == Priority::Critical
 	}
+
+	pub fn is_background(&self) -> bool {
+		*self == Priority::Background
+	}
 }

@@ -1,165 +1,214 @@
 use crate::Priority;
-use super::worker;
-use std::{
-	mem,
-	path::Path,
-	pin::Pin,
-	sync::Arc,
-	task::{Context, Poll},
-};
+use super::worker::{self, IdleWorker, Outcome, QuitNotice, SpawnErr};
+use std::{fmt, mem, path::Path, pin::Pin, sync::Arc, task::{Context, Poll}};
 use async_std::path::PathBuf;
-use futures::{future::BoxFuture, stream::FuturesUnordered};
+use futures::{
+	Future, FutureExt, StreamExt, channel::mpsc, future::BoxFuture, stream::FuturesUnordered,
+};
+use slotmap::SlotMap;
+use assert_matches::assert_matches;
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct WorkerId(pub usize);
+slotmap::new_key_type! { pub struct Worker; }
 
-#[async_trait::async_trait]
-pub trait Pool {
-	fn spawn(&mut self, force: bool) -> Option<WorkerId>;
+pub enum ToPool {
+	/// Request a new worker to spawn.
+	Spawn,
 
-	fn start_work(&mut self, worker_id: WorkerId, code: Arc<Vec<u8>>, artifact_path: PathBuf);
+	/// Kill the given worker. No-op if it's not running.
+	Kill(Worker),
 
-	/// TODO: Rename to something like: "set background priority"
-	fn set_priority(&self, worker_id: WorkerId, priority: bool);
+	/// If the given worker was started with the background priority, then it will be raised up to
+	/// normal priority.
+	BumpPriority(Worker),
 
-	/// Offer the worker back to the pool. The passed worker ID must be considered unusable unless
-	/// it wasn't taken by the pool, in which case it will be returned as `Some`.
-	fn offer_back(&mut self, worker_id: WorkerId) -> Option<WorkerId>;
-
-	fn poll_next(&mut self, cx: &mut Context) -> Poll<PoolEvent>;
+	/// Request the given worker to start working on the given code.
+	StartWork {
+		worker: Worker,
+		code: Arc<Vec<u8>>,
+		artifact_path: PathBuf,
+		background_priority: bool,
+	},
 }
 
-pub enum PoolEvent {
-	/// The given worker has been spawned and now is ready for work.
-	Spawned(WorkerId),
+pub enum FromPool {
+	/// The given worker was just spawned and is ready to be used.
+	Spawned(Worker),
 
-	/// The given worker has concluded assigned work.
-	Concluded(WorkerId),
+	/// A request to spawn a worker is failed. This should be used to free up any reserved resources
+	/// if any.
+	FailedToSpawn,
 
-	/// The given worker has died.
-	Died(WorkerId),
+	/// The given worker either succeeded or failed the given job. Under any circumstances the
+	/// artifact file has been written.
+	Concluded(Worker),
+
+	/// The given worker ceased to exist.
+	Rip(Worker),
 }
 
-enum Action {
-	Spawn(WorkerId),
-	StartWork(WorkerId, Arc<Vec<u8>>, PathBuf),
+struct WorkerData {
+	idle: Option<IdleWorker>,
+	quit_notice: QuitNotice,
+	child: async_process::Child,
 }
 
-enum Child {
-	// TODO: Rename this enum to a slot? The name sounds like the worker is free whereas this is actually about a
-	// child.
-	Free,
-	Reserved,
-	Running { child: async_process::Child },
+impl fmt::Debug for WorkerData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "WorkerData(pid={})", self.child.id())
+    }
 }
 
-impl Child {
-	fn is_free(&self) -> bool {
-		matches!(self, Child::Free)
-	}
+enum PoolEvent {
+	Spawn(Result<(IdleWorker, QuitNotice, async_process::Child), SpawnErr>),
+	StartWork(Worker, Outcome),
+}
 
-	fn reserve(&mut self) {
-		assert!(self.is_free());
-		*self = Child::Reserved;
-	}
+type Mux = FuturesUnordered<BoxFuture<'static, PoolEvent>>;
 
-	fn reset(&mut self) -> Option<async_process::Child> {
-		match mem::replace(self, Child::Free) {
-			Child::Free | Child::Reserved => None,
-			Child::Running { child } => Some(child),
+struct Pool {
+	to_pool: mpsc::Receiver<ToPool>,
+	from_pool: mpsc::UnboundedSender<FromPool>,
+	spawned: SlotMap<Worker, WorkerData>,
+	mux: Mux,
+}
+
+/// A fatal error that warrants stopping the pool.
+struct Fatal;
+
+impl Pool {
+	async fn run(mut self) {
+		loop {
+			// TODO: implement the event loop
 		}
 	}
+}
 
-	fn as_running(&self) -> Option<&async_process::Child> {
-		match *self {
-			Child::Free | Child::Reserved => None,
-			Child::Running { ref child } => Some(child),
+fn handle_to_pool(spawned: &mut SlotMap<Worker, WorkerData>, mux: &mut Mux, to_pool: ToPool) {
+	match to_pool {
+		ToPool::Spawn => {
+			mux.push(async { PoolEvent::Spawn(worker::spawn().await) }.boxed());
+		}
+		ToPool::StartWork {
+			worker,
+			code,
+			artifact_path,
+			background_priority,
+		} => {
+			if let Some(data) = spawned.get_mut(worker) {
+				let idle = data.idle.take().unwrap(); // TODO: this shouldn't be none
+
+				mux.push(
+					async move {
+						// TODO: background prio
+						PoolEvent::StartWork(
+							worker,
+							worker::start_work(idle, code, artifact_path).await,
+						)
+					}
+					.boxed(),
+				);
+			} else {
+				// TODO: Log
+			}
+		}
+		ToPool::Kill(worker) => {
+			if let Some(mut data) = spawned.remove(worker) {
+				if let Err(err) = data.child.kill() {
+					// TODO: Log the error
+				}
+			} else {
+				// TODO: Log
+			}
+		}
+		ToPool::BumpPriority(worker) => {
+			if let Some(idle) = spawned.get(worker) {
+				// TODO: set to the foreground priority
+			} else {
+				// TODO: Log
+			}
 		}
 	}
 }
 
-#[derive(Default)]
-struct RealPool {
-	tasks: FuturesUnordered<BoxFuture<'static, PoolEvent>>,
+fn handle_mux(
+	from_pool: &mut mpsc::UnboundedSender<FromPool>,
+	spawned: &mut SlotMap<Worker, WorkerData>,
+	event: PoolEvent,
+) -> Result<(), Fatal> {
+	match event {
+		PoolEvent::Spawn(result) => {
+			if let Ok((idle_worker, quit_notice, child)) = result {
+				let worker = spawned.insert(WorkerData {
+					idle: Some(idle_worker),
+					quit_notice,
+					child,
+				});
+				from_pool
+					.unbounded_send(FromPool::Spawned(worker))
+					.map_err(|_| Fatal)?;
+			} else {
+				// TODO: log
+			}
 
-	children: Vec<Child>,
+			Ok(())
+		}
+		PoolEvent::StartWork(worker, outcome) => {
+			match outcome {
+				Outcome::Concluded(idle) => {
+					let data = match spawned.get_mut(worker) {
+						None => {
+							// Perhaps the worker was killed meanwhile.
+							return Ok(());
+						}
+						Some(data) => data,
+					};
 
-	/// The maximum number of workers this pool can ever host. This is expected to be a small
-	/// number, e.g. within a dozen.
-	hard_capacity: usize,
+					// We just replace the idle worker that was loaned from this option during
+					// the work starting.
+					let old = data.idle.replace(idle);
+					assert_matches!(old, None, "attempt to overwrite an idle worker");
 
-	/// The number of workers we want aim to have. If there is a critical job and we are already
-	/// at `soft_capacity`, we are allowed to grow up to `hard_capacity`. Thus this should be equal
-	/// or smaller than `hard_capacity`.
-	soft_capacity: usize,
+					// TODO: restore the priority?
+
+					from_pool.unbounded_send(FromPool::Concluded(worker));
+
+					Ok(())
+				}
+				Outcome::DidntMakeIt => {
+					if let Some(mut data) = spawned.remove(worker) {
+						// If the process hasn't been killed, kill it now.
+						let _ = data.child.kill();
+					}
+
+					from_pool
+						.unbounded_send(FromPool::Concluded(worker))
+						.map_err(|_| Fatal)?;
+					from_pool
+						.unbounded_send(FromPool::Rip(worker))
+						.map_err(|_| Fatal)?;
+
+					Ok(())
+				}
+			}
+		}
+	}
 }
 
-#[async_trait::async_trait]
-impl Pool for RealPool {
-	fn spawn(&mut self, force: bool) -> Option<WorkerId> {
-		let spawned = self
-			.children
-			.iter()
-			.filter(|child| !child.is_free())
-			.count();
+pub fn start() -> (
+	mpsc::Sender<ToPool>,
+	mpsc::UnboundedReceiver<FromPool>,
+	impl Future<Output = ()>,
+) {
+	let (to_pool_tx, to_pool_rx) = mpsc::channel(10);
+	let (from_pool_tx, from_pool_rx) = mpsc::unbounded();
 
-		let cap = if force {
-			self.hard_capacity
-		} else {
-			self.soft_capacity
-		};
-		if spawned >= cap {
-			return None;
-		}
-
-		if let Some((idx, child)) = self
-			.children
-			.iter_mut()
-			.enumerate()
-			.find(|(_, child)| child.is_free())
-		{
-			child.reserve();
-			let worker_id = WorkerId(idx);
-			self.tasks.push(async move {
-				// TODO: What to do with an error?
-				let (idle_worker, child) = worker::spawn().await;
-
-			});
-			return Some(worker_id);
-		}
-
-		None
+	let run = Pool {
+		to_pool: to_pool_rx,
+		from_pool: from_pool_tx,
+		spawned: SlotMap::with_capacity_and_key(20),
+		mux: Mux::new(),
 	}
+	.run();
 
-	fn start_work(&mut self, worker_id: WorkerId, code: Arc<Vec<u8>>, artifact_path: PathBuf) {
-
-		todo!()
-	}
-
-	fn set_priority(&self, worker_id: WorkerId, priority: bool) {
-		if let Some(ref child) = self.children[worker_id.0].as_running() {
-			// TODO: renice
-		}
-	}
-
-	fn offer_back(&mut self, worker_id: WorkerId) -> Option<WorkerId> {
-		// TODO: if we are over limit -> kill it
-		// we should probably also return a result so that the queue knows if it can reuse the
-		// worker.
-
-		// Should probably reset the priority to the default?
-
-		todo!()
-	}
-
-	// fn kill(&mut self, worker_id: WorkerId) {
-	// 	if let Some(mut child) = self.children[worker_id.0].reset() {
-	// 		let _ = child.kill();
-	// 		// TODO: report killing error, keep going because it may have succeeded.
-	// 	}
-	// }
-
-	fn poll_next(&mut self, cx: &mut Context) -> Poll<PoolEvent> {
-		todo!()
-	}
+	(to_pool_tx, from_pool_rx, run)
 }

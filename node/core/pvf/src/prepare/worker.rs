@@ -15,13 +15,15 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::Priority;
-use async_std::prelude::*;
 use async_std::{
 	io,
 	os::unix::net::{UnixListener, UnixStream},
 	path::{PathBuf, Path},
 };
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, FutureExt, StreamExt, channel::mpsc};
+use futures::{
+	AsyncRead, AsyncReadExt as _, AsyncWriteExt as _, AsyncWrite, FutureExt as _, StreamExt as _,
+	channel::mpsc,
+};
 use futures_timer::Delay;
 use std::{
 	mem,
@@ -31,20 +33,42 @@ use std::{
 	time::Duration,
 };
 
+#[derive(Debug)]
 pub struct IdleWorker {
 	/// The stream to which the child process is connected.
 	stream: UnixStream,
 }
 
-pub async fn spawn() -> io::Result<(IdleWorker, async_process::Child)> {
+pub enum SpawnErr {
+	Bind,
+	Accept,
+}
+
+/// A future that resolves when we've detected that the worker has stopped.
+pub struct QuitNotice {}
+
+impl futures::Future for QuitNotice {
+	type Output = ();
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		todo!()
+	}
+}
+
+pub async fn spawn() -> Result<(IdleWorker, QuitNotice, async_process::Child), SpawnErr> {
 	let socket_path = transient_socket_path();
-	let listener = UnixListener::bind(&socket_path).await?;
+	let listener = UnixListener::bind(&socket_path)
+		.await
+		.map_err(|_| SpawnErr::Bind)?;
 	let child = spawn_child(socket_path).await;
 
 	// TODO: don't forget to kill the child should the following code fail
 
-	let (mut stream, _) = listener.accept().await?;
-	Ok((IdleWorker { stream }, child))
+	let (mut stream, _) = listener.accept().await.map_err(|_| SpawnErr::Accept)?;
+
+	let quit_notice = QuitNotice {};
+
+	Ok((IdleWorker { stream }, quit_notice, child))
 }
 
 fn transient_socket_path() -> PathBuf {
@@ -65,15 +89,13 @@ pub enum Outcome {
 	DidntMakeIt,
 }
 
-pub async fn start_work(
-	worker: IdleWorker,
-	code: Arc<Vec<u8>>,
-	artifact_path: PathBuf,
-) -> io::Result<Outcome> {
+pub async fn start_work(worker: IdleWorker, code: Arc<Vec<u8>>, artifact_path: PathBuf) -> Outcome {
 	let IdleWorker { mut stream } = worker;
 
-	framed_write(&mut stream, &*code).await?;
-	framed_write(&mut stream, path_bytes(&artifact_path)).await?;
+	if let Err(err) = write_request(&mut stream, code, artifact_path).await {
+		// TODO: Log
+		return Outcome::DidntMakeIt;
+	}
 
 	// Wait for the result from the worker, keeping in mind that there may be a timeout, the
 	// worker may get killed, or something along these lines.
@@ -98,6 +120,16 @@ pub async fn start_work(
 	todo!()
 }
 
+async fn write_request(
+	stream: &mut UnixStream,
+	code: Arc<Vec<u8>>,
+	artifact_path: PathBuf,
+) -> io::Result<()> {
+	framed_write(stream, &*code).await?;
+	framed_write(stream, path_bytes(&artifact_path)).await?;
+	Ok(())
+}
+
 /// Convert the given path into a byte buffer.
 fn path_bytes(path: &Path) -> &[u8] {
 	// Ideally, we take the OsStr of the path, send that and reconstruct this on the other side.
@@ -111,12 +143,12 @@ fn path_bytes(path: &Path) -> &[u8] {
 async fn framed_write(w: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> io::Result<()> {
 	let len_buf = buf.len().to_le_bytes();
 	w.write_all(&len_buf).await?;
-	w.write_all(buf);
+	w.write_all(buf).await;
 	Ok(())
 }
 
 async fn framed_read(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
-	let len_buf = [0u8; mem::size_of::<usize>()];
+	let mut len_buf = [0u8; mem::size_of::<usize>()];
 	r.read_exact(&mut len_buf).await?;
 	let len = usize::from_le_bytes(len_buf);
 	let mut buf = vec![0; len];

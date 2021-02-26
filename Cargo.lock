@@ -5390,6 +5390,7 @@ dependencies = [
 name = "polkadot-node-core-pvf"
 version = "0.1.0"
 dependencies = [
+ "assert_matches",
  "async-process",
  "async-std",
  "async-trait",
@@ -5403,6 +5404,7 @@ dependencies = [
  "sc-executor",
  "sc-executor-common",
  "sc-executor-wasmtime",
+ "slotmap",
  "sp-core",
  "sp-externalities",
  "sp-io",
@@ -8206,6 +8208,15 @@ name = "slab"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c111b5bd5695e56cffe5129854aa230b39c93a305372fdbb2668ca2394eea9f8"
+
+[[package]]
+name = "slotmap"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab3003725ae562cf995f3dc82bb99e70926e09000396816765bb6d7adbe740b1"
+dependencies = [
+ "version_check",
+]
 
 [[package]]
 name = "smallvec"

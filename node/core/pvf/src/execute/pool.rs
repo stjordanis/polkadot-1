@@ -40,7 +40,7 @@ enum ToPool {
 	},
 }
 
-struct ExecuteJob {
+pub struct ExecuteJob {
 	artifact_path: PathBuf,
 	params: Vec<u8>,
 	result_tx: oneshot::Sender<()>,
@@ -169,24 +169,4 @@ async fn perform_execute(
 	}
 
 	worker
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	struct MockWorker;
-	struct MockSpawn;
-
-	impl WorkerSpawn for MockSpawn {
-		type Worker = MockWorker;
-
-		fn new() -> MockWorker {
-			MockWorker
-		}
-
-		fn execute(worker: MockWorker, execute_job: ExecuteJob) -> BoxFuture<'static, MockWorker> {
-			async move { worker }.boxed()
-		}
-	}
 }
