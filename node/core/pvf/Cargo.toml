@@ -12,10 +12,12 @@ assert_matches = "1.4.0"
 bitvec = { version = "0.20.1", default-features = false, features = ["alloc"] }
 futures = "0.3.12"
 futures-timer = "3.0.2"
+futures-lite = "1.11.2"
 slotmap = "1.0"
 tracing-futures = "0.2.4"
 tracing = "0.1.22"
 thiserror = "1.0.23"
+pin-project = "1.0.4"
 polkadot-primitives = { path = "../../../primitives" }
 polkadot-core-primitives = { path = "../../../core-primitives" }
 polkadot-node-subsystem = { path = "../../subsystem" }

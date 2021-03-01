@@ -21,7 +21,7 @@ use async_std::{
 	path::{PathBuf, Path},
 };
 use futures::{
-	AsyncRead, AsyncReadExt as _, AsyncWriteExt as _, AsyncWrite, FutureExt as _, StreamExt as _,
+	AsyncRead, AsyncWrite, AsyncReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _,
 	channel::mpsc,
 };
 use futures_timer::Delay;
@@ -32,6 +32,7 @@ use std::{
 	task::{Context, Poll},
 	time::Duration,
 };
+use pin_project::pin_project;
 
 #[derive(Debug)]
 pub struct IdleWorker {
@@ -42,42 +43,97 @@ pub struct IdleWorker {
 pub enum SpawnErr {
 	Bind,
 	Accept,
+	ProcessSpawn,
 }
 
-/// A future that resolves when we've detected that the worker has stopped.
-pub struct QuitNotice {}
+/// This is a representation of a potentially running worker. Drop it and the process will be killed.
+///
+/// A worker's handle is also a future that resolves when it's detected that the worker's process
+/// has been terminated.
+///
+/// This future relies on the fact that a child process's stdout fd is closed upon it's termination.
+#[pin_project]
+pub struct WorkerHandle {
+	child: async_process::Child,
+	#[pin]
+	stdout: async_process::ChildStdout,
+	drop_box: Box<[u8]>,
+}
 
-impl futures::Future for QuitNotice {
-	type Output = ();
+impl WorkerHandle {
+	fn spawn(program: &str, socket_path: impl AsRef<Path>) -> io::Result<Self> {
+		let mut child = async_process::Command::new(program)
+			// TODO: args
+			.stdout(async_process::Stdio::piped())
+			.kill_on_drop(true)
+			.spawn()?;
 
-	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		todo!()
+		let stdout = child
+			.stdout
+			.take()
+			.expect("the process spawned with piped stdout should have the stdout handle");
+
+		Ok(WorkerHandle {
+			child,
+			stdout,
+			// We don't expect the bytes to be ever read. But in case we do, we should not use a buffer
+			// of a small size, because otherwise if the child process does return any data we will end up
+			// issuing a syscall for each byte. We also prefer not to do allocate that on the stack, since
+			// each poll the buffer will be allocated and initialized (and that's due poll_read takes &mut [u8]
+			// and there are no guarantees that a `poll_read` won't ever read from there even though that's
+			// unlikely).
+			//
+			// OTOH, we also don't want to be super smart here and we could just afford to allocate a buffer
+			// for that here.
+			drop_box: vec![0; 8192].into_boxed_slice(),
+		})
+	}
+
+	/// Returns `pid` of the worker process.
+	pub fn id(&self) -> u32 {
+		self.child.id()
 	}
 }
 
-pub async fn spawn() -> Result<(IdleWorker, QuitNotice, async_process::Child), SpawnErr> {
+impl futures::Future for WorkerHandle {
+	type Output = ();
+
+	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+		use futures_lite::io::AsyncRead;
+
+		let me = self.project();
+		match futures::ready!(AsyncRead::poll_read(me.stdout, cx, &mut *me.drop_box)) {
+			Ok(0) => {
+				// 0 means EOF means the child was terminated. Resolve.
+				Poll::Ready(())
+			}
+			Ok(_bytes_read) => {
+				// weird, we've read something. Pretend that never happened and reschedule ourselves.
+				cx.waker().wake_by_ref();
+				Poll::Pending
+			}
+			Err(_) => {
+				// The implementation is guaranteed to not to return WouldBlock and Interrupted. This
+				// leaves us with a legit errors which we suppose were due to termination.
+				Poll::Ready(())
+			}
+		}
+	}
+}
+
+pub async fn spawn() -> Result<(IdleWorker, WorkerHandle), SpawnErr> {
 	let socket_path = transient_socket_path();
 	let listener = UnixListener::bind(&socket_path)
 		.await
 		.map_err(|_| SpawnErr::Bind)?;
-	let child = spawn_child(socket_path).await;
-
-	// TODO: don't forget to kill the child should the following code fail
-
+	let mut handle = WorkerHandle::spawn("", socket_path).map_err(|_| SpawnErr::ProcessSpawn)?;
 	let (mut stream, _) = listener.accept().await.map_err(|_| SpawnErr::Accept)?;
-
-	let quit_notice = QuitNotice {};
-
-	Ok((IdleWorker { stream }, quit_notice, child))
+	Ok((IdleWorker { stream }, handle))
 }
 
 fn transient_socket_path() -> PathBuf {
 	let mut temp_dir = std::env::temp_dir();
 	temp_dir.push(format!("pvf-prepare-{}", "")); // TODO: see tempfile impl
-	todo!()
-}
-
-async fn spawn_child(socket_path: impl AsRef<Path>) -> async_process::Child {
 	todo!()
 }
 

@@ -1,11 +1,18 @@
 use crate::Priority;
-use super::worker::{self, IdleWorker, Outcome, QuitNotice, SpawnErr};
-use std::{fmt, mem, path::Path, pin::Pin, sync::Arc, task::{Context, Poll}};
+use super::worker::{self, IdleWorker, Outcome, SpawnErr, WorkerHandle};
+use std::{
+	fmt, mem,
+	path::Path,
+	pin::Pin,
+	sync::Arc,
+	task::{Context, Poll},
+};
 use async_std::path::PathBuf;
 use futures::{
-	Future, FutureExt, StreamExt, channel::mpsc, future::BoxFuture, stream::FuturesUnordered,
+	Future, FutureExt, SinkExt, StreamExt, channel::mpsc, future::BoxFuture,
+	stream::FuturesUnordered,
 };
-use slotmap::SlotMap;
+use slotmap::HopSlotMap;
 use assert_matches::assert_matches;
 
 slotmap::new_key_type! { pub struct Worker; }
@@ -48,18 +55,17 @@ pub enum FromPool {
 
 struct WorkerData {
 	idle: Option<IdleWorker>,
-	quit_notice: QuitNotice,
-	child: async_process::Child,
+	handle: WorkerHandle,
 }
 
 impl fmt::Debug for WorkerData {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WorkerData(pid={})", self.child.id())
-    }
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "WorkerData(pid={})", self.handle.id())
+	}
 }
 
 enum PoolEvent {
-	Spawn(Result<(IdleWorker, QuitNotice, async_process::Child), SpawnErr>),
+	Spawn(Result<(IdleWorker, WorkerHandle), SpawnErr>),
 	StartWork(Worker, Outcome),
 }
 
@@ -68,7 +74,7 @@ type Mux = FuturesUnordered<BoxFuture<'static, PoolEvent>>;
 struct Pool {
 	to_pool: mpsc::Receiver<ToPool>,
 	from_pool: mpsc::UnboundedSender<FromPool>,
-	spawned: SlotMap<Worker, WorkerData>,
+	spawned: HopSlotMap<Worker, WorkerData>,
 	mux: Mux,
 }
 
@@ -79,11 +85,33 @@ impl Pool {
 	async fn run(mut self) {
 		loop {
 			// TODO: implement the event loop
+
+			purge_dead(&mut self.from_pool, &mut self.spawned);
 		}
 	}
 }
 
-fn handle_to_pool(spawned: &mut SlotMap<Worker, WorkerData>, mux: &mut Mux, to_pool: ToPool) {
+async fn purge_dead(
+	from_pool: &mut mpsc::UnboundedSender<FromPool>,
+	spawned: &mut HopSlotMap<Worker, WorkerData>,
+) -> Result<(), Fatal> {
+	let mut to_remove = vec![];
+	for (worker, data) in spawned.iter_mut() {
+		if let Poll::Ready(()) = futures::poll!(&mut data.handle) {
+			// a resolved future means that the worker has terminated. Weed it out.
+			to_remove.push(worker);
+		}
+	}
+	for w in to_remove {
+		let _ = spawned.remove(w);
+		from_pool
+			.unbounded_send(FromPool::Rip(w))
+			.map_err(|_| Fatal)?;
+	}
+	Ok(())
+}
+
+fn handle_to_pool(spawned: &mut HopSlotMap<Worker, WorkerData>, mux: &mut Mux, to_pool: ToPool) {
 	match to_pool {
 		ToPool::Spawn => {
 			mux.push(async { PoolEvent::Spawn(worker::spawn().await) }.boxed());
@@ -113,9 +141,7 @@ fn handle_to_pool(spawned: &mut SlotMap<Worker, WorkerData>, mux: &mut Mux, to_p
 		}
 		ToPool::Kill(worker) => {
 			if let Some(mut data) = spawned.remove(worker) {
-				if let Err(err) = data.child.kill() {
-					// TODO: Log the error
-				}
+				drop(data);
 			} else {
 				// TODO: Log
 			}
@@ -132,16 +158,15 @@ fn handle_to_pool(spawned: &mut SlotMap<Worker, WorkerData>, mux: &mut Mux, to_p
 
 fn handle_mux(
 	from_pool: &mut mpsc::UnboundedSender<FromPool>,
-	spawned: &mut SlotMap<Worker, WorkerData>,
+	spawned: &mut HopSlotMap<Worker, WorkerData>,
 	event: PoolEvent,
 ) -> Result<(), Fatal> {
 	match event {
 		PoolEvent::Spawn(result) => {
-			if let Ok((idle_worker, quit_notice, child)) = result {
+			if let Ok((idle_worker, handle)) = result {
 				let worker = spawned.insert(WorkerData {
 					idle: Some(idle_worker),
-					quit_notice,
-					child,
+					handle,
 				});
 				from_pool
 					.unbounded_send(FromPool::Spawned(worker))
@@ -175,17 +200,15 @@ fn handle_mux(
 					Ok(())
 				}
 				Outcome::DidntMakeIt => {
-					if let Some(mut data) = spawned.remove(worker) {
-						// If the process hasn't been killed, kill it now.
-						let _ = data.child.kill();
-					}
-
 					from_pool
 						.unbounded_send(FromPool::Concluded(worker))
 						.map_err(|_| Fatal)?;
-					from_pool
-						.unbounded_send(FromPool::Rip(worker))
-						.map_err(|_| Fatal)?;
+
+					if let Some(_data) = spawned.remove(worker) {
+						from_pool
+							.unbounded_send(FromPool::Rip(worker))
+							.map_err(|_| Fatal)?;
+					}
 
 					Ok(())
 				}
@@ -205,7 +228,7 @@ pub fn start() -> (
 	let run = Pool {
 		to_pool: to_pool_rx,
 		from_pool: from_pool_tx,
-		spawned: SlotMap::with_capacity_and_key(20),
+		spawned: HopSlotMap::with_capacity_and_key(20),
 		mux: Mux::new(),
 	}
 	.run();
