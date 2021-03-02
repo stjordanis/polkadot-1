@@ -56,7 +56,8 @@ struct Inner {
 	to_prepare_queue_tx: mpsc::Sender<prepare::ToQueue>,
 	from_prepare_queue_rx: mpsc::UnboundedReceiver<prepare::FromQueue>,
 
-	execute_pool: execute::Pool<()>,
+	to_execute_queue_tx: mpsc::Sender<execute::ToQueue>,
+
 	artifacts: Artifacts,
 }
 
@@ -64,7 +65,6 @@ impl Inner {
 	async fn run(mut self) {
 		let mut from_handle_rx = self.from_handle_rx.fuse();
 		let mut prepare_queue = self.from_prepare_queue_rx.fuse();
-		let mut execute_pool = self.execute_pool;
 		let mut artifacts = self.artifacts;
 
 		loop {
@@ -73,7 +73,7 @@ impl Inner {
 					handle_from_handle(
 						&mut artifacts,
 						&mut self.to_prepare_queue_tx,
-						&mut execute_pool,
+						&mut self.to_execute_queue_tx,
 						from_handle,
 					)
 					.await;
@@ -90,11 +90,10 @@ impl Inner {
 					// worker but we don't for the sake of simplicity.
 					handle_prepare_done(
 						&mut artifacts,
-						&mut execute_pool,
+						&mut self.to_execute_queue_tx,
 						artifact_id,
-					);
+					).await;
 				},
-				() = execute_pool.select_next_some() => {}
 			}
 		}
 	}
@@ -103,7 +102,7 @@ impl Inner {
 async fn handle_from_handle(
 	artifacts: &mut Artifacts,
 	prepare_queue: &mut mpsc::Sender<prepare::ToQueue>,
-	execute_pool: &mut execute::Pool<()>,
+	execute_queue: &mut mpsc::Sender<execute::ToQueue>,
 	from_handle: FromHandle,
 ) {
 	match from_handle {
@@ -116,7 +115,7 @@ async fn handle_from_handle(
 			handle_execute_pvf(
 				artifacts,
 				prepare_queue,
-				execute_pool,
+				execute_queue,
 				pvf,
 				params,
 				priority,
@@ -133,7 +132,7 @@ async fn handle_from_handle(
 async fn handle_execute_pvf(
 	artifacts: &mut Artifacts,
 	prepare_queue: &mut mpsc::Sender<prepare::ToQueue>,
-	execute_pool: &mut execute::Pool<()>,
+	execute_queue: &mut mpsc::Sender<execute::ToQueue>,
 	pvf: Pvf,
 	params: Vec<u8>,
 	priority: Priority,
@@ -145,7 +144,13 @@ async fn handle_execute_pvf(
 		Entry::Occupied(mut o) => match *o.get_mut() {
 			ArtifactState::Prepared {
 				ref artifact_path, ..
-			} => execute_pool.enqueue(artifact_path.clone(), params, result_tx),
+			} => {
+				execute_queue.send(execute::ToQueue::Enqueue {
+					artifact_path: artifact_path.clone(),
+					params,
+					result_tx,
+				});
+			}
 			ArtifactState::Preparing {
 				ref mut pending_requests,
 			} => {
@@ -189,21 +194,23 @@ async fn handle_heads_up(
 	}
 }
 
-fn handle_prepare_done(
+async fn handle_prepare_done(
 	artifacts: &mut Artifacts,
-	execute_pool: &mut execute::Pool<()>,
+	execute_queue: &mut mpsc::Sender<execute::ToQueue>,
 	artifact_id: ArtifactId,
 ) {
 	let artifact_path = artifact_id.path(&artifacts.cache_path);
 	let artifact_state = artifacts.artifacts.remove(&artifact_id).unwrap(); // TODO:
 	match artifact_state {
 		ArtifactState::Preparing { pending_requests } => {
-			for pending_request in pending_requests {
-				execute_pool.enqueue(
-					artifact_path.clone(),
-					pending_request.params,
-					pending_request.result_tx,
-				)
+			for PendingExecutionRequest { params, result_tx } in pending_requests {
+				execute_queue
+					.send(execute::ToQueue::Enqueue {
+						artifact_path: artifact_path.clone(),
+						params,
+						result_tx,
+					})
+					.await;
 			}
 		}
 		_ => panic!(), // TODO:

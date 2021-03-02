@@ -168,7 +168,10 @@ impl Queue {
 	}
 
 	async fn run(mut self) {
-		loop {}
+		loop {
+			// TODO: implement
+			// TODO: Handle rip from the pool by decreasing the `spawned_num`.
+		}
 	}
 }
 
@@ -187,9 +190,11 @@ async fn enqueue(queue: &mut Queue, prio: Priority, pvf: Pvf) {
 	}
 
 	if let Some(available) = queue.workers.find_available() {
+		// TODO: Explain, why this should be fair, i.e. that the work won't be handled out of order.
 		assign(queue, available, prio, pvf).await;
 	} else {
 		if queue.workers.can_afford_one_more(prio.is_critical()) {
+			queue.workers.spawned_num += 1;
 			queue.to_pool_tx.send(pool::ToPool::Spawn).await;
 		}
 		queue.unscheduled.push((prio, pvf));
@@ -254,7 +259,7 @@ pub fn start(
 	mpsc::UnboundedReceiver<FromQueue>,
 	impl Future<Output = ()>,
 ) {
-	let (to_queue_tx, to_queue_rx) = mpsc::channel(20);
+	let (to_queue_tx, to_queue_rx) = mpsc::channel(150);
 	let (from_queue_tx, from_queue_rx) = mpsc::unbounded();
 
 	let run = Queue::new(

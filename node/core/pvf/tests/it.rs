@@ -1,4 +1,4 @@
-use polkadot_node_core_pvf::integration_test::prepare::{spawn_with_program_path, start_work, SpawnErr};
+use polkadot_node_core_pvf::integration_test::worker_common::{spawn_with_program_path, SpawnErr};
 
 const PUPPET_EXE: &str = env!("CARGO_BIN_EXE_puppet_worker");
 

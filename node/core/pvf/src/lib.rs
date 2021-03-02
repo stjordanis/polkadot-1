@@ -22,13 +22,18 @@ mod prepare;
 mod priority;
 mod pvf;
 mod wasmtime;
+mod worker_common;
 
 pub use priority::Priority;
 pub use pvf::Pvf;
 
 #[doc(hidden)]
 pub mod integration_test {
+	pub mod worker_common {
+		pub use crate::worker_common::{spawn_with_program_path, SpawnErr};
+	}
+
 	pub mod prepare {
-		pub use crate::prepare::{spawn_with_program_path, start_work, SpawnErr};
+		
 	}
 }

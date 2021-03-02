@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
-mod pool;
+mod queue;
 mod worker;
 
-pub use pool::Pool;
+pub use queue::ToQueue;

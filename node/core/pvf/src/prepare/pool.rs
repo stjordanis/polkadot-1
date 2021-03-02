@@ -1,5 +1,10 @@
-use crate::Priority;
-use super::worker::{self, IdleWorker, Outcome, SpawnErr, WorkerHandle};
+use crate::{
+	Priority,
+	worker_common::{IdleWorker, WorkerHandle, SpawnErr},
+};
+use super::{
+	worker::{self, Outcome},
+};
 use std::{
 	fmt, mem,
 	path::Path,
@@ -147,8 +152,8 @@ fn handle_to_pool(spawned: &mut HopSlotMap<Worker, WorkerData>, mux: &mut Mux, t
 			}
 		}
 		ToPool::BumpPriority(worker) => {
-			if let Some(mut data) = spawned.get(worker) {
-				// TODO: set to the foreground priority
+			if let Some(data) = spawned.get(worker) {
+				worker::bump_priority(&data.handle);
 			} else {
 				// TODO: Log
 			}
@@ -192,8 +197,6 @@ fn handle_mux(
 					// the work starting.
 					let old = data.idle.replace(idle);
 					assert_matches!(old, None, "attempt to overwrite an idle worker");
-
-					// TODO: restore the priority?
 
 					from_pool.unbounded_send(FromPool::Concluded(worker));
 

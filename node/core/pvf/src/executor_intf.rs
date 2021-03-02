@@ -21,20 +21,8 @@ use sp_core::{
 	storage::{ChildInfo, TrackedStorageKey},
 };
 
-// TODO: should write into an artifact path.
-pub fn compile(code: &[u8]) {
-	use sp_wasm_interface::HostFunctions;
-
-	// TODO: This is a mess.
-	//
-	// sc-executor-wasmtime should provide APIs just to compile a given module.
-	sc_executor_wasmtime::create_runtime(
-		code,
-		1024,
-		sp_io::SubstrateHostFunctions::host_functions(),
-		true,
-		None,
-	);
+pub fn prepare(code: &[u8]) -> Vec<u8> {
+	todo!()
 }
 
 /// The validation externalities that will panic on any storage related access. They just provide
