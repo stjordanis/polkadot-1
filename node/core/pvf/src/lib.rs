@@ -25,3 +25,10 @@ mod wasmtime;
 
 pub use priority::Priority;
 pub use pvf::Pvf;
+
+#[doc(hidden)]
+pub mod integration_test {
+	pub mod prepare {
+		pub use crate::prepare::{spawn_with_program_path, start_work, SpawnErr};
+	}
+}

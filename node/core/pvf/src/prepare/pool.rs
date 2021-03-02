@@ -127,10 +127,10 @@ fn handle_to_pool(spawned: &mut HopSlotMap<Worker, WorkerData>, mux: &mut Mux, t
 
 				mux.push(
 					async move {
-						// TODO: background prio
 						PoolEvent::StartWork(
 							worker,
-							worker::start_work(idle, code, artifact_path).await,
+							worker::start_work(idle, code, artifact_path, background_priority)
+								.await,
 						)
 					}
 					.boxed(),
@@ -147,7 +147,7 @@ fn handle_to_pool(spawned: &mut HopSlotMap<Worker, WorkerData>, mux: &mut Mux, t
 			}
 		}
 		ToPool::BumpPriority(worker) => {
-			if let Some(idle) = spawned.get(worker) {
+			if let Some(mut data) = spawned.get(worker) {
 				// TODO: set to the foreground priority
 			} else {
 				// TODO: Log
