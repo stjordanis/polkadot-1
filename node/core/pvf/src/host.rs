@@ -22,7 +22,7 @@ use std::{
 use async_std::path::{Path, PathBuf};
 use crate::{Priority, Pvf, artifacts::ArtifactId, execute, prepare};
 use futures::{
-	FutureExt, SinkExt, StreamExt,
+	Future, FutureExt, SinkExt, StreamExt,
 	channel::{mpsc, oneshot},
 	future::BoxFuture,
 	stream::FuturesUnordered,
@@ -61,40 +61,58 @@ struct Inner {
 	artifacts: Artifacts,
 }
 
-impl Inner {
-	async fn run(mut self) {
-		let mut from_handle_rx = self.from_handle_rx.fuse();
-		let mut prepare_queue = self.from_prepare_queue_rx.fuse();
-		let mut artifacts = self.artifacts;
+async fn run(
+	Inner {
+		from_handle_rx,
+		from_prepare_queue_rx,
+		mut to_prepare_queue_tx,
+		mut to_execute_queue_tx,
+		mut artifacts,
+		..
+	}: Inner,
+	prepare_queue: impl Future<Output = ()>,
+	prepare_pool: impl Future<Output = ()>,
+	execute_pool: impl Future<Output = ()>,
+) {
+	futures::pin_mut!(prepare_queue, prepare_pool, execute_pool);
 
-		loop {
-			futures::select! {
-				from_handle = from_handle_rx.select_next_some() => {
-					handle_from_handle(
-						&mut artifacts,
-						&mut self.to_prepare_queue_tx,
-						&mut self.to_execute_queue_tx,
-						from_handle,
-					)
-					.await;
-				},
-				prepare::FromQueue::Prepared(artifact_id) = prepare_queue.select_next_some() => {
-					// Note that preparation always succeeds.
-					//
-					// That's because the error conditions are written into the artifact and will be
-					// reported at the time of the  execution. It potentially, but not necessarily,
-					// can be scheduled as a result of this function call, in case there are pending
-					// executions.
-					//
-					// We could be eager in terms of reporting and plumb the result from the prepartion
-					// worker but we don't for the sake of simplicity.
-					handle_prepare_done(
-						&mut artifacts,
-						&mut self.to_execute_queue_tx,
-						artifact_id,
-					).await;
-				},
-			}
+	let mut from_handle_rx = from_handle_rx.fuse();
+	let mut from_prepare_queue_rx = from_prepare_queue_rx.fuse();
+
+	loop {
+		if futures::poll!(&mut prepare_queue).is_ready()
+			|| futures::poll!(&mut prepare_pool).is_ready()
+			|| futures::poll!(&mut execute_pool).is_ready()
+		{
+			// TODO: Shouldn't happen
+		}
+
+		futures::select! {
+			from_handle = from_handle_rx.select_next_some() => {
+				handle_from_handle(
+					&mut artifacts,
+					&mut to_prepare_queue_tx,
+					&mut to_execute_queue_tx,
+					from_handle,
+				)
+				.await;
+			},
+			prepare::FromQueue::Prepared(artifact_id) = from_prepare_queue_rx.select_next_some() => {
+				// Note that preparation always succeeds.
+				//
+				// That's because the error conditions are written into the artifact and will be
+				// reported at the time of the  execution. It potentially, but not necessarily,
+				// can be scheduled as a result of this function call, in case there are pending
+				// executions.
+				//
+				// We could be eager in terms of reporting and plumb the result from the prepartion
+				// worker but we don't for the sake of simplicity.
+				handle_prepare_done(
+					&mut artifacts,
+					&mut to_execute_queue_tx,
+					artifact_id,
+				).await;
+			},
 		}
 	}
 }
