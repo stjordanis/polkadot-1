@@ -37,8 +37,8 @@ impl Artifact {
 		self.encode()
 	}
 
-	pub fn deserialize(mut bytes: &[u8]) -> Result<Self, ()> {
-		Artifact::decode(&mut bytes).map_err(|_| ())
+	pub fn deserialize(mut bytes: &[u8]) -> Result<Self, String> {
+		Artifact::decode(&mut bytes).map_err(|e| format!("{:?}", e))
 	}
 }
 

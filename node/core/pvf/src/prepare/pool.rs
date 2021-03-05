@@ -46,10 +46,6 @@ pub enum FromPool {
 	/// The given worker was just spawned and is ready to be used.
 	Spawned(Worker),
 
-	/// A request to spawn a worker is failed. This should be used to free up any reserved resources
-	/// if any.
-	FailedToSpawn,
-
 	/// The given worker either succeeded or failed the given job. Under any circumstances the
 	/// artifact file has been written.
 	Concluded(Worker),
@@ -70,7 +66,7 @@ impl fmt::Debug for WorkerData {
 }
 
 enum PoolEvent {
-	Spawn(Result<(IdleWorker, WorkerHandle), SpawnErr>),
+	Spawn(IdleWorker, WorkerHandle),
 	StartWork(Worker, Outcome),
 }
 
@@ -137,7 +133,19 @@ async fn purge_dead(
 fn handle_to_pool(spawned: &mut HopSlotMap<Worker, WorkerData>, mux: &mut Mux, to_pool: ToPool) {
 	match to_pool {
 		ToPool::Spawn => {
-			mux.push(async { PoolEvent::Spawn(worker::spawn().await) }.boxed());
+			mux.push(
+				async {
+					loop {
+						match worker::spawn().await {
+							Ok((idle, handle)) => break PoolEvent::Spawn(idle, handle),
+							Err(err) => {
+								// TODO: log
+							}
+						}
+					}
+				}
+				.boxed(),
+			);
 		}
 		ToPool::StartWork {
 			worker,
@@ -185,18 +193,14 @@ fn handle_mux(
 	event: PoolEvent,
 ) -> Result<(), Fatal> {
 	match event {
-		PoolEvent::Spawn(result) => {
-			if let Ok((idle_worker, handle)) = result {
-				let worker = spawned.insert(WorkerData {
-					idle: Some(idle_worker),
-					handle,
-				});
-				from_pool
-					.unbounded_send(FromPool::Spawned(worker))
-					.map_err(|_| Fatal)?;
-			} else {
-				// TODO: log
-			}
+		PoolEvent::Spawn(idle, handle) => {
+			let worker = spawned.insert(WorkerData {
+				idle: Some(idle),
+				handle,
+			});
+			from_pool
+				.unbounded_send(FromPool::Spawned(worker))
+				.map_err(|_| Fatal)?;
 
 			Ok(())
 		}

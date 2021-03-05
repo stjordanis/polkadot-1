@@ -41,7 +41,7 @@ impl ValidationHost {
 	pub async fn execute_pvf(
 		&mut self,
 		pvf: Pvf,
-		params: &[u8],
+		params: Vec<u8>,
 		priority: Priority,
 	) -> Result<ValidationResult, ValidationError> {
 		let (result_tx, result_rx) =
@@ -50,7 +50,7 @@ impl ValidationHost {
 		self.from_handle_tx
 			.send(FromHandle::ExecutePvf {
 				pvf,
-				params: params.to_owned(),
+				params,
 				priority,
 				result_tx,
 			})
@@ -61,6 +61,12 @@ impl ValidationHost {
 		result_rx.await.map_err(|_| {
 			ValidationError::Internal(InternalError::System("the result was dropped".into()))
 		})?
+	}
+
+	pub async fn heads_up(&mut self, active_pvfs: Vec<Pvf>) {
+		self.from_handle_tx
+			.send(FromHandle::HeadsUp { active_pvfs })
+			.await;
 	}
 }
 
@@ -152,7 +158,7 @@ async fn run(
 			|| futures::poll!(&mut prepare_pool).is_ready()
 			|| futures::poll!(&mut execute_pool).is_ready()
 		{
-			// TODO: Shouldn't happen
+			// TODO: Shouldn't happen typically. If it did we should break the event loop.
 		}
 
 		futures::select! {

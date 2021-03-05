@@ -192,9 +192,6 @@ async fn handle_from_pool(queue: &mut Queue, from_pool: pool::FromPool) -> Resul
 	use pool::FromPool::*;
 	match from_pool {
 		Spawned(worker) => handle_worker_spawned(queue, worker).await?,
-		FailedToSpawn => {
-			// TODO: Respawn with delay?
-		}
 		Concluded(worker) => handle_worker_concluded(queue, worker).await?,
 		Rip(worker) => handle_worker_rip(queue, worker).await?,
 	}

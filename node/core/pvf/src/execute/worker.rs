@@ -30,7 +30,10 @@ pub enum Outcome {
 		duration_ms: u64,
 		idle_worker: IdleWorker,
 	},
-	InvalidCandidate(String),
+	InvalidCandidate {
+		err: String,
+		idle_worker: IdleWorker,
+	},
 	HardTimeout,
 	IoErr,
 }
@@ -65,7 +68,10 @@ pub async fn start_work(
 			duration_ms,
 			idle_worker: IdleWorker { stream, pid },
 		},
-		Response::InvalidCandidate(err) => Outcome::InvalidCandidate(err),
+		Response::InvalidCandidate(err) => Outcome::InvalidCandidate {
+			err,
+			idle_worker: IdleWorker { stream, pid },
+		},
 	}
 }
 
@@ -124,7 +130,12 @@ pub fn worker_entrypoint(socket_path: &str) {
 		loop {
 			let (artifact_path, params) = recv_request(&mut stream).await?;
 			let artifact_bytes = async_std::fs::read(&artifact_path).await?;
-			let artifact = Artifact::deserialize(&artifact_bytes).unwrap(); // TODO:
+			let artifact = Artifact::deserialize(&artifact_bytes).map_err(|e| {
+				io::Error::new(
+					io::ErrorKind::Other,
+					format!("artifact deserialization error: {}", e),
+				)
+			})?;
 			let response = validate_using_artifact(&artifact, &params);
 			send_response(&mut stream, response).await?;
 		}

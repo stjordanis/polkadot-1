@@ -11,7 +11,10 @@ use futures::{
 	stream::{FuturesOrdered, FuturesUnordered, StreamExt as _},
 };
 use async_std::path::PathBuf;
-use polkadot_parachain::{primitives::ValidationResult, wasm_executor::ValidationError};
+use polkadot_parachain::{
+	primitives::ValidationResult,
+	wasm_executor::{InvalidCandidate, ValidationError},
+};
 use slotmap::HopSlotMap;
 
 slotmap::new_key_type! { struct Worker; }
@@ -69,15 +72,19 @@ impl Workers {
 }
 
 enum QueueEvent {
-	Spawn(Result<(IdleWorker, WorkerHandle), SpawnErr>),
-	StartWork(Worker, Outcome),
+	Spawn((IdleWorker, WorkerHandle)),
+	StartWork(
+		Worker,
+		Outcome,
+		oneshot::Sender<Result<ValidationResult, ValidationError>>,
+	),
 }
 
 type Mux = FuturesUnordered<BoxFuture<'static, QueueEvent>>;
 
 struct Queue {
 	/// The receiver that receives messages to the pool.
-	to_queue_tx: mpsc::Receiver<ToQueue>,
+	to_queue_rx: mpsc::Receiver<ToQueue>,
 
 	/// The queue of jobs that are waiting for a worker to pick up.
 	queue: VecDeque<ExecuteJob>,
@@ -88,9 +95,9 @@ struct Queue {
 }
 
 impl Queue {
-	fn new(to_queue_tx: mpsc::Receiver<ToQueue>) -> Self {
+	fn new(to_queue_rx: mpsc::Receiver<ToQueue>) -> Self {
 		Self {
-			to_queue_tx,
+			to_queue_rx,
 			queue: VecDeque::new(),
 			mux: Mux::new(),
 			workers: Workers {
@@ -103,7 +110,11 @@ impl Queue {
 
 	async fn run(mut self) {
 		loop {
-			// TODO: loop
+			futures::select! {
+				to_queue = self.to_queue_rx.select_next_some() =>
+					handle_to_queue(&mut self, to_queue),
+				ev = self.mux.select_next_some() => handle_mux(&mut self, ev).await,
+			}
 
 			purge_dead(&mut self.workers).await;
 		}
@@ -141,27 +152,110 @@ fn handle_to_queue(queue: &mut Queue, to_queue: ToQueue) {
 		assign(queue, available, job);
 	} else {
 		if queue.workers.can_afford_one_more() {
-			spawn_one(queue);
+			spawn_extra_worker(queue);
 		}
 		queue.queue.push_back(job);
 	}
 }
 
-/// If there are pending jobs in the queue, schedules the next of them onto the just freed up
-/// worker. Otherwise, puts back into the available workers list.
-fn handle_job_finish(queue: &mut Queue, just_freed: Worker) {
-	if let Some(job) = queue.queue.pop_front() {
-		assign(queue, just_freed, job);
-	} else {
-		// TODO: if there are no jobs available put the worker back?
+async fn handle_mux(queue: &mut Queue, event: QueueEvent) {
+	match event {
+		QueueEvent::Spawn((idle, handle)) => {
+			let worker = queue.workers.running.insert(WorkerData {
+				idle: Some(idle),
+				handle,
+			});
+
+			if let Some(job) = queue.queue.pop_front() {
+				assign(queue, worker, job);
+			}
+		}
+		QueueEvent::StartWork(worker, outcome, result_tx) => {
+			handle_job_finish(queue, worker, outcome, result_tx);
+		}
 	}
 }
 
-fn spawn_one(queue: &mut Queue) {
+/// If there are pending jobs in the queue, schedules the next of them onto the just freed up
+/// worker. Otherwise, puts back into the available workers list.
+fn handle_job_finish(
+	queue: &mut Queue,
+	worker: Worker,
+	outcome: Outcome,
+	result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
+) {
+	let (idle_worker, result) = match outcome {
+		Outcome::Ok {
+			result_descriptor,
+			duration_ms,
+			idle_worker,
+		} => {
+			// TODO: propagate the soft timeout
+			drop(duration_ms);
+
+			(Some(idle_worker), Ok(result_descriptor))
+		}
+		Outcome::InvalidCandidate { err, idle_worker } => (
+			Some(idle_worker),
+			Err(ValidationError::InvalidCandidate(
+				InvalidCandidate::ExternalWasmExecutor(err),
+			)),
+		),
+		Outcome::HardTimeout => (
+			None,
+			Err(ValidationError::InvalidCandidate(
+				InvalidCandidate::ExternalWasmExecutor("hard timeout".to_string()),
+			)),
+		),
+		Outcome::IoErr => (
+			None,
+			Err(ValidationError::InvalidCandidate(
+				InvalidCandidate::ExternalWasmExecutor(
+					"io err communicating with worker".to_string(),
+				),
+			)),
+		),
+	};
+
+	// First we send the result. It may fail due the other end of the channel being dropped, that's
+	// legitimate and we don't treat that as a error.
+	let _ = result_tx.send(result);
+
+	// Then, we should deal with the worker:
+	//
+	// - if the `idle_worker` token was returned we should either schedule the next task or just put
+	//   it back so that the next incoming job will be able to claim it
+	//
+	// - if the `idle_worker` token was consumed, all the metadata pertaining to that worker should
+	//   be removed.
+	if let Some(idle_worker) = idle_worker {
+		if let Some(data) = queue.workers.running.get_mut(worker) {
+			data.idle = Some(idle_worker);
+
+			if let Some(job) = queue.queue.pop_front() {
+				assign(queue, worker, job);
+			}
+		}
+	} else {
+		queue.workers.running.remove(worker);
+	}
+}
+
+fn spawn_extra_worker(queue: &mut Queue) {
 	queue.workers.spawned_num += 1;
-	queue
-		.mux
-		.push(async move { QueueEvent::Spawn(super::worker::spawn().await) }.boxed());
+	queue.mux.push(
+		async move {
+			loop {
+				match super::worker::spawn().await {
+					Ok((idle, handle)) => break QueueEvent::Spawn((idle, handle)),
+					Err(_err) => {
+						// TODO: log and retry
+					}
+				}
+			}
+		}
+		.boxed(),
+	);
 }
 
 fn assign(queue: &mut Queue, worker: Worker, job: ExecuteJob) {
@@ -169,7 +263,7 @@ fn assign(queue: &mut Queue, worker: Worker, job: ExecuteJob) {
 	queue.mux.push(
 		async move {
 			let outcome = super::worker::start_work(idle, job.artifact_path, job.params).await;
-			QueueEvent::StartWork(worker, outcome)
+			QueueEvent::StartWork(worker, outcome, job.result_tx)
 		}
 		.boxed(),
 	);

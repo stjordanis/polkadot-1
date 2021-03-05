@@ -28,6 +28,9 @@ pub use pvf::Pvf;
 
 pub use host::start;
 
+pub use execute::worker_entrypoint as execute_worker_entrypoint;
+pub use prepare::worker_entrypoint as prepare_worker_entrypoint;
+
 #[doc(hidden)]
 pub mod integration_test {
 	pub mod worker_common {

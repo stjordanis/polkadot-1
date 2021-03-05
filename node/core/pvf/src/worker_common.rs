@@ -185,7 +185,7 @@ pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 pub async fn framed_send(w: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> io::Result<()> {
 	let len_buf = buf.len().to_le_bytes();
 	w.write_all(&len_buf).await?;
-	w.write_all(buf).await;
+	w.write_all(buf).await?;
 	Ok(())
 }
 

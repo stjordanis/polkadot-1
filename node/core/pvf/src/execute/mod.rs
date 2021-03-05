@@ -18,3 +18,4 @@ mod queue;
 mod worker;
 
 pub use queue::{ToQueue, start};
+pub use worker::worker_entrypoint;
