@@ -7,12 +7,11 @@ use super::{
 };
 use std::{
 	fmt, mem,
-	path::Path,
 	pin::Pin,
 	sync::Arc,
 	task::{Context, Poll},
 };
-use async_std::path::PathBuf;
+use async_std::path::{Path, PathBuf};
 use futures::{
 	Future, FutureExt, SinkExt, StreamExt, channel::mpsc, future::BoxFuture,
 	stream::FuturesUnordered,
@@ -73,6 +72,7 @@ enum PoolEvent {
 type Mux = FuturesUnordered<BoxFuture<'static, PoolEvent>>;
 
 struct Pool {
+	program_path: PathBuf,
 	to_pool: mpsc::Receiver<ToPool>,
 	from_pool: mpsc::UnboundedSender<FromPool>,
 	spawned: HopSlotMap<Worker, WorkerData>,
@@ -84,6 +84,7 @@ struct Fatal;
 
 async fn run(
 	Pool {
+		program_path,
 		to_pool,
 		mut from_pool,
 		mut spawned,
@@ -102,7 +103,8 @@ async fn run(
 
 	loop {
 		futures::select! {
-			to_pool = to_pool.next() => handle_to_pool(&mut spawned, &mut mux, to_pool.unwrap()),
+			to_pool = to_pool.next() =>
+				handle_to_pool(&program_path, &mut spawned, &mut mux, to_pool.unwrap()),
 			ev = mux.select_next_some() => break_if_fatal!(handle_mux(&mut from_pool, &mut spawned, ev)),
 		}
 
@@ -130,13 +132,19 @@ async fn purge_dead(
 	Ok(())
 }
 
-fn handle_to_pool(spawned: &mut HopSlotMap<Worker, WorkerData>, mux: &mut Mux, to_pool: ToPool) {
+fn handle_to_pool(
+	program_path: &Path,
+	spawned: &mut HopSlotMap<Worker, WorkerData>,
+	mux: &mut Mux,
+	to_pool: ToPool,
+) {
 	match to_pool {
 		ToPool::Spawn => {
+			let program_path = program_path.to_owned();
 			mux.push(
-				async {
+				async move {
 					loop {
-						match worker::spawn().await {
+						match worker::spawn(&program_path).await {
 							Ok((idle, handle)) => break PoolEvent::Spawn(idle, handle),
 							Err(err) => {
 								// TODO: log
@@ -244,7 +252,9 @@ fn handle_mux(
 	}
 }
 
-pub fn start() -> (
+pub fn start(
+	program_path: PathBuf,
+) -> (
 	mpsc::Sender<ToPool>,
 	mpsc::UnboundedReceiver<FromPool>,
 	impl Future<Output = ()>,
@@ -253,6 +263,7 @@ pub fn start() -> (
 	let (from_pool_tx, from_pool_rx) = mpsc::unbounded();
 
 	let run = run(Pool {
+		program_path,
 		to_pool: to_pool_rx,
 		from_pool: from_pool_tx,
 		spawned: HopSlotMap::with_capacity_and_key(20),

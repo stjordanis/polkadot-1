@@ -31,7 +31,7 @@ pub async fn spawn_with_program_path(
 		.await
 		.map_err(|_| SpawnErr::Bind)?;
 
-	let mut handle = WorkerHandle::spawn(&*program_path, extra_args, socket_path)
+	let mut handle = WorkerHandle::spawn(&*program_path, extra_args, &socket_path)
 		.map_err(|_| SpawnErr::ProcessSpawn)?;
 
 	futures::select! {
@@ -110,6 +110,7 @@ impl WorkerHandle {
 	) -> io::Result<Self> {
 		let mut child = async_process::Command::new(program)
 			.args(extra_args)
+			.arg(socket_path.as_ref().as_os_str())
 			.stdout(async_process::Stdio::piped())
 			.kill_on_drop(true)
 			.spawn()?;

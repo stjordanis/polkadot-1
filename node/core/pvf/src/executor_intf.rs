@@ -31,7 +31,7 @@ const CONFIG: Config = Config {
 	allow_missing_func_imports: true,
 	cache_path: None,
 	semantics: Semantics {
-		fast_instance_reuse: true,
+		fast_instance_reuse: false,
 		stack_depth_metering: false,
 	},
 };

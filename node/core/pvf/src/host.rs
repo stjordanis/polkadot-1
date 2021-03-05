@@ -68,7 +68,7 @@ impl ValidationHost {
 				ValidationError::Internal(InternalError::System("the inner loop hung up".into()))
 			})?;
 		result_rx.await.map_err(|_| {
-			ValidationError::Internal(InternalError::System("the result was dropped".into()))
+			ValidationError::Internal(InternalError::System("execute_pvf was interrupted".into()))
 		})?
 	}
 
@@ -93,7 +93,7 @@ enum FromHandle {
 	},
 }
 
-pub fn start(cache_path: &Path) -> (ValidationHost, impl Future<Output = ()>) {
+pub fn start(program_path: &Path, cache_path: &Path) -> (ValidationHost, impl Future<Output = ()>) {
 	let cache_path = cache_path.to_owned();
 
 	let (from_handle_tx, from_handle_rx) = mpsc::channel(10);
@@ -102,7 +102,8 @@ pub fn start(cache_path: &Path) -> (ValidationHost, impl Future<Output = ()>) {
 		from_handle_tx: Mutex::new(from_handle_tx),
 	};
 
-	let (to_prepare_pool, from_prepare_pool, run_prepare_pool) = prepare::start_pool();
+	let (to_prepare_pool, from_prepare_pool, run_prepare_pool) =
+		prepare::start_pool(program_path.to_owned());
 
 	let soft_capacity = 5;
 	let hard_capacity = 8;
@@ -114,10 +115,12 @@ pub fn start(cache_path: &Path) -> (ValidationHost, impl Future<Output = ()>) {
 		from_prepare_pool,
 	);
 
-	let (to_execute_queue_tx, run_execute_queue) = execute::start();
+	let (to_execute_queue_tx, run_execute_queue) = execute::start(program_path.to_owned());
 
 	let run = async move {
 		let artifacts = Artifacts::new(&cache_path).await;
+
+		futures::pin_mut!(run_prepare_queue, run_prepare_pool, run_execute_queue);
 
 		run(
 			Inner {
@@ -163,24 +166,27 @@ async fn run(
 		mut to_execute_queue_tx,
 		mut awaiting_prepare,
 	}: Inner,
-	prepare_pool: impl Future<Output = ()>,
-	prepare_queue: impl Future<Output = ()>,
-	execute_pool: impl Future<Output = ()>,
+	prepare_pool: impl Future<Output = ()> + Unpin,
+	prepare_queue: impl Future<Output = ()> + Unpin,
+	execute_queue: impl Future<Output = ()> + Unpin,
 ) {
-	futures::pin_mut!(prepare_queue, prepare_pool, execute_pool);
-
 	let mut from_handle_rx = from_handle_rx.fuse();
 	let mut from_prepare_queue_rx = from_prepare_queue_rx.fuse();
+	let mut prepare_queue = prepare_queue.fuse();
+	let mut prepare_pool = prepare_pool.fuse();
+	let mut execute_queue = execute_queue.fuse();
 
 	loop {
-		if futures::poll!(&mut prepare_queue).is_ready()
-			|| futures::poll!(&mut prepare_pool).is_ready()
-			|| futures::poll!(&mut execute_pool).is_ready()
-		{
-			// TODO: Shouldn't happen typically. If it did we should break the event loop.
-		}
-
 		futures::select! {
+			_ = prepare_queue => {
+				panic!()
+			}
+			_ = prepare_pool => {
+				panic!()
+			}
+			_ = execute_queue => {
+				panic!()
+			}
 			from_handle = from_handle_rx.select_next_some() => {
 				handle_from_handle(
 					&mut artifacts,

@@ -18,10 +18,9 @@ use futures_timer::Delay;
 use polkadot_parachain::{primitives::ValidationResult, wasm_executor::ValidationError};
 use parity_scale_codec::{Encode, Decode};
 
-pub async fn spawn() -> Result<(IdleWorker, WorkerHandle), SpawnErr> {
-	let current_exe = std::env::current_exe().map_err(|_| SpawnErr::CurrentExe)?;
-	let program_path = current_exe.to_string_lossy();
-	spawn_with_program_path(&*program_path, &[]).await
+pub async fn spawn(program_path: &Path) -> Result<(IdleWorker, WorkerHandle), SpawnErr> {
+	let program_path = program_path.to_string_lossy();
+	spawn_with_program_path(&program_path, &["execute-worker"]).await
 }
 
 pub enum Outcome {

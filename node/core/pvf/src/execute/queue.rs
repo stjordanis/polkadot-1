@@ -59,7 +59,10 @@ impl Workers {
 	}
 
 	fn find_available(&self) -> Option<Worker> {
-		todo!()
+		self.running
+			.iter()
+			.filter_map(|d| if d.1.idle.is_some() { Some(d.0) } else { None })
+			.next()
 	}
 
 	fn claim_idle(&mut self, worker: Worker) -> IdleWorker {
@@ -83,6 +86,8 @@ enum QueueEvent {
 type Mux = FuturesUnordered<BoxFuture<'static, QueueEvent>>;
 
 struct Queue {
+	program_path: PathBuf,
+
 	/// The receiver that receives messages to the pool.
 	to_queue_rx: mpsc::Receiver<ToQueue>,
 
@@ -95,8 +100,9 @@ struct Queue {
 }
 
 impl Queue {
-	fn new(to_queue_rx: mpsc::Receiver<ToQueue>) -> Self {
+	fn new(program_path: PathBuf, to_queue_rx: mpsc::Receiver<ToQueue>) -> Self {
 		Self {
+			program_path,
 			to_queue_rx,
 			queue: VecDeque::new(),
 			mux: Mux::new(),
@@ -242,11 +248,11 @@ fn handle_job_finish(
 }
 
 fn spawn_extra_worker(queue: &mut Queue) {
-	queue.workers.spawned_num += 1;
+	let program_path = queue.program_path.clone();
 	queue.mux.push(
 		async move {
 			loop {
-				match super::worker::spawn().await {
+				match super::worker::spawn(&program_path).await {
 					Ok((idle, handle)) => break QueueEvent::Spawn((idle, handle)),
 					Err(_err) => {
 						// TODO: log and retry
@@ -256,6 +262,8 @@ fn spawn_extra_worker(queue: &mut Queue) {
 		}
 		.boxed(),
 	);
+
+	queue.workers.spawned_num += 1;
 }
 
 fn assign(queue: &mut Queue, worker: Worker, job: ExecuteJob) {
@@ -269,8 +277,8 @@ fn assign(queue: &mut Queue, worker: Worker, job: ExecuteJob) {
 	);
 }
 
-pub fn start() -> (mpsc::Sender<ToQueue>, impl Future<Output = ()>) {
+pub fn start(program_path: PathBuf) -> (mpsc::Sender<ToQueue>, impl Future<Output = ()>) {
 	let (to_queue_tx, to_queue_rx) = mpsc::channel(20);
-	let run = Queue::new(to_queue_rx).run();
+	let run = Queue::new(program_path, to_queue_rx).run();
 	(to_queue_tx, run)
 }

@@ -47,16 +47,9 @@ use pin_project::pin_project;
 const NICENESS_BACKGROUND: i32 = 5;
 const NICENESS_FOREGROUND: i32 = 0;
 
-pub async fn spawn() -> Result<(IdleWorker, WorkerHandle), SpawnErr> {
-	// NOTE: `current_exe` is known to be prone to priviledge escalation exploits if used
-	//        with a hard link as suggested in its rustdoc.
-	//
-	//        However, I believe this is not very relevant to us since the exploitation requires
-	//        the binary to be under suid and which is a bad idea anyway. Furthermore, our
-	//        security model assumes that an attacker doesn't have access to the local machine.
-	let current_exe = std::env::current_exe().map_err(|_| SpawnErr::CurrentExe)?;
-	let program_path = current_exe.to_string_lossy();
-	spawn_with_program_path(&*program_path, &[]).await
+pub async fn spawn(program_path: &Path) -> Result<(IdleWorker, WorkerHandle), SpawnErr> {
+	let program_path = program_path.to_string_lossy();
+	spawn_with_program_path(&program_path, &["prepare-worker"]).await
 }
 
 pub enum Outcome {
@@ -164,8 +157,7 @@ pub fn worker_entrypoint(socket_path: &str) {
 		loop {
 			let code = recv_request(&mut stream).await?;
 
-			let artifact_bytes = prepare_artifact(&code)
-				.serialize();
+			let artifact_bytes = prepare_artifact(&code).serialize();
 
 			// Write the serialized artifact into into a temp file.
 			let dest = tmpfile("prepare-artifact-");
@@ -186,13 +178,11 @@ fn prepare_artifact(code: &[u8]) -> Artifact {
 		Err(err) => {
 			return Artifact::PrevalidationErr(format!("{:?}", err));
 		}
-	    Ok(b) => b,
+		Ok(b) => b,
 	};
 
 	match crate::executor_intf::prepare(blob) {
-		Ok(compiled_artifact) => {
-			Artifact::Compiled { compiled_artifact }
-		}
+		Ok(compiled_artifact) => Artifact::Compiled { compiled_artifact },
 		Err(err) => Artifact::PreparationErr(format!("{:?}", err)),
 	}
 }
