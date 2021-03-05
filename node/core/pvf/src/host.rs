@@ -24,7 +24,10 @@ use std::{
 	sync::Arc,
 	time::SystemTime,
 };
-use async_std::path::{Path, PathBuf};
+use async_std::{
+	path::{Path, PathBuf},
+	sync::Mutex,
+};
 use polkadot_parachain::{
 	primitives::ValidationResult,
 	wasm_executor::{InternalError, ValidationError},
@@ -38,12 +41,12 @@ use futures::{
 use polkadot_core_primitives::Hash;
 
 pub struct ValidationHost {
-	from_handle_tx: mpsc::Sender<FromHandle>,
+	from_handle_tx: Mutex<mpsc::Sender<FromHandle>>,
 }
 
 impl ValidationHost {
 	pub async fn execute_pvf(
-		&mut self,
+		&self,
 		pvf: Pvf,
 		params: Vec<u8>,
 		priority: Priority,
@@ -52,6 +55,8 @@ impl ValidationHost {
 			oneshot::channel::<Result<ValidationResult, ValidationError>>();
 
 		self.from_handle_tx
+			.lock()
+			.await
 			.send(FromHandle::ExecutePvf {
 				pvf,
 				params,
@@ -69,6 +74,8 @@ impl ValidationHost {
 
 	pub async fn heads_up(&mut self, active_pvfs: Vec<Pvf>) {
 		self.from_handle_tx
+			.lock()
+			.await
 			.send(FromHandle::HeadsUp { active_pvfs })
 			.await;
 	}
@@ -91,7 +98,9 @@ pub fn start(cache_path: &Path) -> (ValidationHost, impl Future<Output = ()>) {
 
 	let (from_handle_tx, from_handle_rx) = mpsc::channel(10);
 
-	let validation_host = ValidationHost { from_handle_tx };
+	let validation_host = ValidationHost {
+		from_handle_tx: Mutex::new(from_handle_tx),
+	};
 
 	let (to_prepare_pool, from_prepare_pool, run_prepare_pool) = prepare::start_pool();
 
