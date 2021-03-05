@@ -21,11 +21,12 @@ mod host;
 mod prepare;
 mod priority;
 mod pvf;
-mod wasmtime;
 mod worker_common;
 
 pub use priority::Priority;
 pub use pvf::Pvf;
+
+pub use host::start;
 
 #[doc(hidden)]
 pub mod integration_test {
@@ -34,6 +35,6 @@ pub mod integration_test {
 	}
 
 	pub mod prepare {
-		
+
 	}
 }

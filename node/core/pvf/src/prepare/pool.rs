@@ -86,13 +86,31 @@ struct Pool {
 /// A fatal error that warrants stopping the pool.
 struct Fatal;
 
-impl Pool {
-	async fn run(mut self) {
-		loop {
-			// TODO: implement the event loop
+async fn run(
+	Pool {
+		to_pool,
+		mut from_pool,
+		mut spawned,
+		mut mux,
+	}: Pool,
+) {
+	macro_rules! break_if_fatal {
+		($expr:expr) => {
+			if let Err(Fatal) = $expr {
+				break;
+				}
+		};
+	}
 
-			purge_dead(&mut self.from_pool, &mut self.spawned);
+	let mut to_pool = to_pool.fuse();
+
+	loop {
+		futures::select! {
+			to_pool = to_pool.next() => handle_to_pool(&mut spawned, &mut mux, to_pool.unwrap()),
+			ev = mux.select_next_some() => break_if_fatal!(handle_mux(&mut from_pool, &mut spawned, ev)),
 		}
+
+		break_if_fatal!(purge_dead(&mut from_pool, &mut spawned).await);
 	}
 }
 
@@ -198,7 +216,9 @@ fn handle_mux(
 					let old = data.idle.replace(idle);
 					assert_matches!(old, None, "attempt to overwrite an idle worker");
 
-					from_pool.unbounded_send(FromPool::Concluded(worker));
+					from_pool
+						.unbounded_send(FromPool::Concluded(worker))
+						.map_err(|_| Fatal)?;
 
 					Ok(())
 				}
@@ -228,13 +248,12 @@ pub fn start() -> (
 	let (to_pool_tx, to_pool_rx) = mpsc::channel(10);
 	let (from_pool_tx, from_pool_rx) = mpsc::unbounded();
 
-	let run = Pool {
+	let run = run(Pool {
 		to_pool: to_pool_rx,
 		from_pool: from_pool_tx,
 		spawned: HopSlotMap::with_capacity_and_key(20),
 		mux: Mux::new(),
-	}
-	.run();
+	});
 
 	(to_pool_tx, from_pool_rx, run)
 }

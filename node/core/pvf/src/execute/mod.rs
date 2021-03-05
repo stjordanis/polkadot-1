@@ -17,4 +17,4 @@
 mod queue;
 mod worker;
 
-pub use queue::ToQueue;
+pub use queue::{ToQueue, start};

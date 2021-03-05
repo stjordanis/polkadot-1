@@ -1,14 +1,22 @@
 use std::time::Instant;
 
-use crate::worker_common::{
-	IdleWorker, SpawnErr, WorkerHandle, bytes_to_path, framed_read, framed_write, path_to_bytes,
-	spawn_with_program_path,
+use crate::{
+	artifacts::Artifact,
+	worker_common::{
+		IdleWorker, SpawnErr, WorkerHandle, bytes_to_path, framed_recv, framed_send, path_to_bytes,
+		spawn_with_program_path,
+	},
 };
+use std::time::Duration;
 use async_std::{
 	io,
 	os::unix::net::UnixStream,
 	path::{Path, PathBuf},
 };
+use futures::FutureExt;
+use futures_timer::Delay;
+use polkadot_parachain::{primitives::ValidationResult, wasm_executor::ValidationError};
+use parity_scale_codec::{Encode, Decode};
 
 pub async fn spawn() -> Result<(IdleWorker, WorkerHandle), SpawnErr> {
 	let current_exe = std::env::current_exe().map_err(|_| SpawnErr::CurrentExe)?;
@@ -17,15 +25,14 @@ pub async fn spawn() -> Result<(IdleWorker, WorkerHandle), SpawnErr> {
 }
 
 pub enum Outcome {
-	ValidationResult {
-		// TODO: the result itself, Ok or InvalidCandidate
-		soft_timeout: bool,
+	Ok {
+		result_descriptor: ValidationResult,
+		duration_ms: u64,
 		idle_worker: IdleWorker,
 	},
+	InvalidCandidate(String),
 	HardTimeout,
-	// TODO: In this case we should try to recompile the binary?
-	Deserialization,
-	Error,
+	IoErr,
 }
 
 pub async fn start_work(
@@ -35,57 +42,135 @@ pub async fn start_work(
 ) -> Outcome {
 	let IdleWorker { mut stream, pid } = worker;
 
-	if let Err(err) = write_request(&mut stream, &artifact_path, &validation_params).await {
-		return Outcome::Error;
+	if let Err(_err) = send_request(&mut stream, &artifact_path, &validation_params).await {
+		return Outcome::IoErr;
 	}
 
-	// futures::select! {
+	let response = futures::select! {
+		response = recv_response(&mut stream).fuse() => {
+			match response {
+				Err(_err) => return Outcome::IoErr,
+				Ok(response) => response,
+			}
+		},
+		_ = Delay::new(Duration::from_secs(3)).fuse() => return Outcome::HardTimeout,
+	};
 
-	// }
-
-	todo!()
+	match response {
+		Response::Ok {
+			result_descriptor,
+			duration_ms,
+		} => Outcome::Ok {
+			result_descriptor,
+			duration_ms,
+			idle_worker: IdleWorker { stream, pid },
+		},
+		Response::InvalidCandidate(err) => Outcome::InvalidCandidate(err),
+	}
 }
 
-async fn write_request(
+async fn send_request(
 	stream: &mut UnixStream,
 	artifact_path: &Path,
 	validation_params: &[u8],
 ) -> io::Result<()> {
-	framed_write(stream, path_to_bytes(artifact_path)).await?;
-	framed_write(stream, validation_params).await?;
+	framed_send(stream, path_to_bytes(artifact_path)).await?;
+	framed_send(stream, validation_params).await?;
 	Ok(())
 }
 
-async fn read_request(stream: &mut UnixStream) -> io::Result<(PathBuf, Vec<u8>)> {
-	let artifact_path = framed_read(stream).await?;
+async fn recv_request(stream: &mut UnixStream) -> io::Result<(PathBuf, Vec<u8>)> {
+	let artifact_path = framed_recv(stream).await?;
 	let artifact_path = bytes_to_path(&artifact_path);
-	let params = framed_read(stream).await?;
+	let params = framed_recv(stream).await?;
 	Ok((artifact_path, params))
 }
 
+async fn send_response(stream: &mut UnixStream, response: Response) -> io::Result<()> {
+	framed_send(stream, &response.encode()).await?;
+	Ok(())
+}
+
+async fn recv_response(stream: &mut UnixStream) -> io::Result<Response> {
+	let response_bytes = framed_recv(stream).await?;
+	let response = Response::decode(&mut &response_bytes[..])
+		.map_err(|e| io::Error::new(io::ErrorKind::Other, "response decode error"))?;
+	Ok(response)
+}
+
+#[derive(Encode, Decode)]
+enum Response {
+	Ok {
+		result_descriptor: ValidationResult,
+		duration_ms: u64,
+	},
+	InvalidCandidate(String),
+}
+
+impl Response {
+	fn format_invalid(ctx: &'static str, msg: &str) -> Self {
+		if msg.is_empty() {
+			Self::InvalidCandidate(ctx.to_string())
+		} else {
+			Self::InvalidCandidate(format!("{}: {}", ctx, msg))
+		}
+	}
+}
+
 pub fn worker_entrypoint(socket_path: &str) {
-	let err = async_std::task::block_on(async {
+	let err = async_std::task::block_on::<_, io::Result<()>>(async {
 		let mut stream = UnixStream::connect(socket_path).await?;
 
 		loop {
-			let (artifact_path, params) = read_request(&mut stream).await?;
-
-			let validation_started_at = Instant::now();
-
-			// TODO:
-			// - Load the artifact
-			// - Create an sc-executor-wasmtime instance from it
-			// - Execute it with the given params.
-
-			// TODO: if `validation_started_at` exceeded the soft deadline threshold, we should
-			// set soft_timeout = true.
-
-			// TODO: write the response
+			let (artifact_path, params) = recv_request(&mut stream).await?;
+			let artifact_bytes = async_std::fs::read(&artifact_path).await?;
+			let artifact = Artifact::deserialize(&artifact_bytes).unwrap(); // TODO:
+			let response = validate_using_artifact(&artifact, &params);
+			send_response(&mut stream, response).await?;
 		}
-
-		io::Result::<()>::Ok(())
 	})
 	.unwrap_err();
 
 	drop(err)
+}
+
+fn validate_using_artifact(artifact: &Artifact, params: &[u8]) -> Response {
+	let compiled_artifact = match artifact {
+		Artifact::PrevalidationErr(msg) => {
+			return Response::format_invalid("prevalidation", msg);
+		}
+		Artifact::PreparationErr(msg) => {
+			return Response::format_invalid("preparation", msg);
+		}
+		Artifact::DidntMakeIt => {
+			return Response::format_invalid("preparation timeout", "");
+		}
+
+		Artifact::Compiled { compiled_artifact } => compiled_artifact,
+	};
+
+	let validation_started_at = Instant::now();
+	let descriptor_bytes = match crate::executor_intf::execute(compiled_artifact, params) {
+		Err(err) => {
+			return Response::format_invalid("execute", &err.to_string());
+		}
+		Ok(d) => d,
+	};
+
+	let duration_ms = validation_started_at.elapsed().as_millis() as u64;
+
+	let result_descriptor = match ValidationResult::decode(&mut &descriptor_bytes[..]) {
+		Err(err) => {
+			return Response::InvalidCandidate(format!(
+				"validation result decoding failed: {}",
+				err
+			))
+		}
+		Ok(r) => r,
+	};
+
+	Response::Ok {
+		result_descriptor,
+		duration_ms,
+	}
 }

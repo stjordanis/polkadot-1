@@ -182,14 +182,14 @@ pub fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 	PathBuf::from_str(&str_buf).unwrap()
 }
 
-pub async fn framed_write(w: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> io::Result<()> {
+pub async fn framed_send(w: &mut (impl AsyncWrite + Unpin), buf: &[u8]) -> io::Result<()> {
 	let len_buf = buf.len().to_le_bytes();
 	w.write_all(&len_buf).await?;
 	w.write_all(buf).await;
 	Ok(())
 }
 
-pub async fn framed_read(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
+pub async fn framed_recv(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
 	let mut len_buf = [0u8; mem::size_of::<usize>()];
 	r.read_exact(&mut len_buf).await?;
 	let len = usize::from_le_bytes(len_buf);
@@ -197,5 +197,3 @@ pub async fn framed_read(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>
 	r.read_exact(&mut buf).await?;
 	Ok(buf)
 }
-
-// TODO: rename those two above to `framed_send` and `framed_recv`.

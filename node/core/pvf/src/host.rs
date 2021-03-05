@@ -20,6 +20,10 @@ use std::{
 	time::SystemTime,
 };
 use async_std::path::{Path, PathBuf};
+use polkadot_parachain::{
+	primitives::ValidationResult,
+	wasm_executor::{InternalError, ValidationError},
+};
 use crate::{Priority, Pvf, artifacts::ArtifactId, execute, prepare};
 use futures::{
 	Future, FutureExt, SinkExt, StreamExt,
@@ -29,12 +33,34 @@ use futures::{
 };
 use polkadot_core_primitives::Hash;
 
-struct ValidationHost;
+pub struct ValidationHost {
+	from_handle_tx: mpsc::Sender<FromHandle>,
+}
 
 impl ValidationHost {
-	pub async fn execute_pvf(&self, pvf: Pvf, params: &[u8], priority: Priority) {
-		let (result_tx, result_rx) = oneshot::channel::<()>();
-		todo!()
+	pub async fn execute_pvf(
+		&mut self,
+		pvf: Pvf,
+		params: &[u8],
+		priority: Priority,
+	) -> Result<ValidationResult, ValidationError> {
+		let (result_tx, result_rx) =
+			oneshot::channel::<Result<ValidationResult, ValidationError>>();
+
+		self.from_handle_tx
+			.send(FromHandle::ExecutePvf {
+				pvf,
+				params: params.to_owned(),
+				priority,
+				result_tx,
+			})
+			.await
+			.map_err(|_| {
+				ValidationError::Internal(InternalError::System("the inner loop hung up".into()))
+			})?;
+		result_rx.await.map_err(|_| {
+			ValidationError::Internal(InternalError::System("the result was dropped".into()))
+		})?
 	}
 }
 
@@ -43,11 +69,53 @@ enum FromHandle {
 		pvf: Pvf,
 		params: Vec<u8>,
 		priority: Priority,
-		result_tx: oneshot::Sender<()>, // TODO: type
+		result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
 	},
 	HeadsUp {
 		active_pvfs: Vec<Pvf>,
 	},
+}
+
+pub fn start(cache_path: &Path) -> (ValidationHost, impl Future<Output = ()>) {
+	let cache_path = cache_path.to_owned();
+
+	let (from_handle_tx, from_handle_rx) = mpsc::channel(10);
+
+	let validation_host = ValidationHost { from_handle_tx };
+
+	let (to_prepare_pool, from_prepare_pool, run_prepare_pool) = prepare::start_pool();
+
+	let soft_capacity = 5;
+	let hard_capacity = 8;
+	let (to_prepare_queue_tx, from_prepare_queue_rx, run_prepare_queue) = prepare::start_queue(
+		soft_capacity,
+		hard_capacity,
+		cache_path.clone(),
+		to_prepare_pool,
+		from_prepare_pool,
+	);
+
+	let (to_execute_queue_tx, run_execute_queue) = execute::start();
+
+	let run = async move {
+		let artifacts = Artifacts::new(cache_path.to_owned()).await;
+
+		run(
+			Inner {
+				from_handle_rx,
+				to_prepare_queue_tx,
+				from_prepare_queue_rx,
+				to_execute_queue_tx,
+				artifacts,
+			},
+			run_prepare_pool,
+			run_prepare_queue,
+			run_execute_queue,
+		)
+		.await
+	};
+
+	(validation_host, run)
 }
 
 struct Inner {
@@ -70,8 +138,8 @@ async fn run(
 		mut artifacts,
 		..
 	}: Inner,
-	prepare_queue: impl Future<Output = ()>,
 	prepare_pool: impl Future<Output = ()>,
+	prepare_queue: impl Future<Output = ()>,
 	execute_pool: impl Future<Output = ()>,
 ) {
 	futures::pin_mut!(prepare_queue, prepare_pool, execute_pool);
@@ -154,7 +222,7 @@ async fn handle_execute_pvf(
 	pvf: Pvf,
 	params: Vec<u8>,
 	priority: Priority,
-	result_tx: oneshot::Sender<()>,
+	result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
 ) {
 	let artifact_id = pvf.to_artifact_id();
 
@@ -245,7 +313,7 @@ async fn handle_prepare_done(
 
 struct PendingExecutionRequest {
 	params: Vec<u8>,
-	result_tx: oneshot::Sender<()>, // TODO: Proper result
+	result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
 }
 
 enum ArtifactState {

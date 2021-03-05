@@ -11,6 +11,7 @@ use futures::{
 	stream::{FuturesOrdered, FuturesUnordered, StreamExt as _},
 };
 use async_std::path::PathBuf;
+use polkadot_parachain::{primitives::ValidationResult, wasm_executor::ValidationError};
 use slotmap::HopSlotMap;
 
 slotmap::new_key_type! { struct Worker; }
@@ -19,14 +20,14 @@ pub enum ToQueue {
 	Enqueue {
 		artifact_path: PathBuf,
 		params: Vec<u8>,
-		result_tx: oneshot::Sender<()>, // TODO: validation result
+		result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
 	},
 }
 
 struct ExecuteJob {
 	artifact_path: PathBuf,
 	params: Vec<u8>,
-	result_tx: oneshot::Sender<()>,
+	result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
 }
 
 struct WorkerData {
@@ -59,7 +60,10 @@ impl Workers {
 	}
 
 	fn claim_idle(&mut self, worker: Worker) -> IdleWorker {
-		let data = self.running.get_mut(worker).expect("the worker doesn't exist");
+		let data = self
+			.running
+			.get_mut(worker)
+			.expect("the worker doesn't exist");
 		data.idle.take().expect("the worker has no idle token")
 	}
 }
@@ -90,10 +94,9 @@ impl Queue {
 			queue: VecDeque::new(),
 			mux: Mux::new(),
 			workers: Workers {
-			    running: HopSlotMap::with_capacity_and_key(10),
-			    spawned_num: 0,
-			    capacity: 10,
-
+				running: HopSlotMap::with_capacity_and_key(10),
+				spawned_num: 0,
+				capacity: 10,
 			},
 		}
 	}

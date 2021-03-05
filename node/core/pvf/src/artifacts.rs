@@ -17,9 +17,29 @@
 use async_std::path::{Path, PathBuf};
 use polkadot_core_primitives::Hash;
 use std::{collections::HashMap};
+use parity_scale_codec::{Encode, Decode};
 
+#[derive(Encode, Decode)]
 pub enum Artifact {
-	Wasmtime(crate::wasmtime::WasmtimeArtifact),
+	PrevalidationErr(String),
+	PreparationErr(String),
+	/// This state indicates that the process assigned to prepare the artifact wasn't responsible
+	/// or were killed.
+	DidntMakeIt,
+	Compiled {
+		compiled_artifact: Vec<u8>,
+	},
+}
+
+impl Artifact {
+	/// Serializes this struct into a byte buffer.
+	pub fn serialize(&self) -> Vec<u8> {
+		self.encode()
+	}
+
+	pub fn deserialize(mut bytes: &[u8]) -> Result<Self, ()> {
+		Artifact::decode(&mut bytes).map_err(|_| ())
+	}
 }
 
 /// NOTE if we get to multiple engine implementations the artifact ID should include the engine

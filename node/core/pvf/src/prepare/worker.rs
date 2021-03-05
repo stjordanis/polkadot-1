@@ -16,9 +16,10 @@
 
 use crate::{
 	Priority,
+	artifacts::Artifact,
 	worker_common::{
-		IdleWorker, SpawnErr, WorkerHandle, bytes_to_path, framed_read, framed_write,
-		path_to_bytes, spawn_with_program_path, tmpfile,
+		IdleWorker, SpawnErr, WorkerHandle, bytes_to_path, framed_recv, framed_send, path_to_bytes,
+		spawn_with_program_path, tmpfile,
 	},
 };
 use async_std::{
@@ -64,6 +65,9 @@ pub enum Outcome {
 	/// The execution was interrupted abruptly and the worker is not available anymore. For example,
 	/// this could've happen because the worker hadn't finished the work until the given deadline.
 	///
+	/// Note that in this case the artifact file is written (unless there was an error writing the
+	/// the artifact).
+	///
 	/// This doesn't return an idle worker instance, thus this worker is no longer usable.
 	DidntMakeIt,
 }
@@ -80,7 +84,7 @@ pub async fn start_work(
 		renice(pid, NICENESS_BACKGROUND);
 	}
 
-	if let Err(err) = write_request(&mut stream, code).await {
+	if let Err(err) = send_request(&mut stream, code).await {
 		// TODO: Log
 		return Outcome::DidntMakeIt;
 	}
@@ -99,11 +103,11 @@ pub async fn start_work(
 	}
 
 	let selected = futures::select! {
-		artifact_path_bytes = framed_read(&mut stream).fuse() => {
+		artifact_path_bytes = framed_recv(&mut stream).fuse() => {
 			match artifact_path_bytes {
 				Ok(bytes) => {
 					let tmp_path = bytes_to_path(&bytes);
-					async_std::fs::rename(tmp_path, artifact_path)
+					async_std::fs::rename(tmp_path, &artifact_path)
 						.await
 						.map(|_| Selected::Done)
 						.unwrap_or(Selected::IoErr)
@@ -119,19 +123,22 @@ pub async fn start_work(
 			renice(pid, NICENESS_FOREGROUND);
 			Outcome::Concluded(IdleWorker { stream, pid })
 		}
-		Selected::IoErr | Selected::Deadline => Outcome::DidntMakeIt,
+		Selected::IoErr | Selected::Deadline => {
+			let bytes = Artifact::DidntMakeIt.serialize();
+			// best effort: there is nothing we can do here if the write fails.
+			let _ = async_std::fs::write(&artifact_path, &bytes).await;
+			Outcome::DidntMakeIt
+		}
 	}
 }
 
-// TODO: rename to `send` and `recv`.
-
-async fn write_request(stream: &mut UnixStream, code: Arc<Vec<u8>>) -> io::Result<()> {
-	framed_write(stream, &*code).await?;
+async fn send_request(stream: &mut UnixStream, code: Arc<Vec<u8>>) -> io::Result<()> {
+	framed_send(stream, &*code).await?;
 	Ok(())
 }
 
-async fn read_request(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
-	let code = framed_read(stream).await?;
+async fn recv_request(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+	let code = framed_recv(stream).await?;
 	Ok(code)
 }
 
@@ -151,25 +158,43 @@ fn renice(pid: u32, niceness: i32) {
 }
 
 pub fn worker_entrypoint(socket_path: &str) {
-	let err = async_std::task::block_on(async {
+	let err = async_std::task::block_on::<_, io::Result<()>>(async {
 		let mut stream = UnixStream::connect(socket_path).await?;
 
 		loop {
-			let code = read_request(&mut stream).await?;
-			let artifact_contents = crate::executor_intf::prepare(&code);
+			let code = recv_request(&mut stream).await?;
 
+			let artifact_bytes = prepare_artifact(&code)
+				.serialize();
+
+			// Write the serialized artifact into into a temp file.
 			let dest = tmpfile("prepare-artifact-");
-			async_std::fs::write(&dest, &artifact_contents).await?;
+			async_std::fs::write(&dest, &artifact_bytes).await?;
 
-			framed_write(&mut stream, &path_to_bytes(&dest)).await?;
+			// Communicate the results back to the host.
+			framed_send(&mut stream, &path_to_bytes(&dest)).await?;
 		}
-
-		io::Result::<()>::Ok(())
 	})
 	.unwrap_err();
 
 	// TODO: proper handling
 	drop(err);
+}
+
+fn prepare_artifact(code: &[u8]) -> Artifact {
+	let blob = match crate::executor_intf::prevalidate(code) {
+		Err(err) => {
+			return Artifact::PrevalidationErr(format!("{:?}", err));
+		}
+	    Ok(b) => b,
+	};
+
+	match crate::executor_intf::prepare(blob) {
+		Ok(compiled_artifact) => {
+			Artifact::Compiled { compiled_artifact }
+		}
+		Err(err) => Artifact::PreparationErr(format!("{:?}", err)),
+	}
 }
 
 #[cfg(test)]
