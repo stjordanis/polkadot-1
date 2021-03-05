@@ -108,7 +108,7 @@ pub async fn start_work(
 				Err(_) => Selected::IoErr,
 			}
 		},
-		_ = Delay::new(Duration::from_secs(3)).fuse() => Selected::Deadline,
+		_ = Delay::new(Duration::from_secs(10)).fuse() => Selected::Deadline, // TODO: increased, because compiling takes a lot of time in debug mode, make this customizable
 	};
 
 	match selected {

@@ -7,6 +7,7 @@ use polkadot_parachain::{
 };
 use parity_scale_codec::Encode as _;
 
+mod adder;
 mod worker_common;
 
 const PUPPET_EXE: &str = env!("CARGO_BIN_EXE_puppet_worker");
@@ -94,7 +95,7 @@ async fn parallel_execution() {
 	);
 
 	let start = std::time::Instant::now();
-	futures::join!(execute_pvf_future_1, execute_pvf_future_2);
+	let (_, _) = futures::join!(execute_pvf_future_1, execute_pvf_future_2);
 
 	// TODO: Check the validity of these
 
