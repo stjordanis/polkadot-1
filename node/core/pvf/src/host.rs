@@ -14,6 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
+use crate::{
+	Priority, Pvf,
+	artifacts::{Artifacts, ArtifactState, ArtifactId},
+	execute, prepare,
+};
 use std::{
 	collections::{HashMap, hash_map::Entry},
 	sync::Arc,
@@ -24,7 +29,6 @@ use polkadot_parachain::{
 	primitives::ValidationResult,
 	wasm_executor::{InternalError, ValidationError},
 };
-use crate::{Priority, Pvf, artifacts::ArtifactId, execute, prepare};
 use futures::{
 	Future, FutureExt, SinkExt, StreamExt,
 	channel::{mpsc, oneshot},
@@ -104,15 +108,17 @@ pub fn start(cache_path: &Path) -> (ValidationHost, impl Future<Output = ()>) {
 	let (to_execute_queue_tx, run_execute_queue) = execute::start();
 
 	let run = async move {
-		let artifacts = Artifacts::new(cache_path.to_owned()).await;
+		let artifacts = Artifacts::new(&cache_path).await;
 
 		run(
 			Inner {
+				cache_path,
+				artifacts,
 				from_handle_rx,
 				to_prepare_queue_tx,
 				from_prepare_queue_rx,
 				to_execute_queue_tx,
-				artifacts,
+				awaiting_prepare: HashMap::new(),
 			},
 			run_prepare_pool,
 			run_prepare_queue,
@@ -125,6 +131,9 @@ pub fn start(cache_path: &Path) -> (ValidationHost, impl Future<Output = ()>) {
 }
 
 struct Inner {
+	cache_path: PathBuf,
+	artifacts: Artifacts,
+
 	from_handle_rx: mpsc::Receiver<FromHandle>,
 
 	to_prepare_queue_tx: mpsc::Sender<prepare::ToQueue>,
@@ -132,17 +141,18 @@ struct Inner {
 
 	to_execute_queue_tx: mpsc::Sender<execute::ToQueue>,
 
-	artifacts: Artifacts,
+	awaiting_prepare: HashMap<ArtifactId, Vec<PendingExecutionRequest>>,
 }
 
 async fn run(
 	Inner {
+		cache_path,
+		mut artifacts,
 		from_handle_rx,
 		from_prepare_queue_rx,
 		mut to_prepare_queue_tx,
 		mut to_execute_queue_tx,
-		mut artifacts,
-		..
+		mut awaiting_prepare,
 	}: Inner,
 	prepare_pool: impl Future<Output = ()>,
 	prepare_queue: impl Future<Output = ()>,
@@ -167,6 +177,7 @@ async fn run(
 					&mut artifacts,
 					&mut to_prepare_queue_tx,
 					&mut to_execute_queue_tx,
+					&mut awaiting_prepare,
 					from_handle,
 				)
 				.await;
@@ -182,8 +193,10 @@ async fn run(
 				// We could be eager in terms of reporting and plumb the result from the prepartion
 				// worker but we don't for the sake of simplicity.
 				handle_prepare_done(
+					&cache_path,
 					&mut artifacts,
 					&mut to_execute_queue_tx,
+					&mut awaiting_prepare,
 					artifact_id,
 				).await;
 			},
@@ -195,6 +208,7 @@ async fn handle_from_handle(
 	artifacts: &mut Artifacts,
 	prepare_queue: &mut mpsc::Sender<prepare::ToQueue>,
 	execute_queue: &mut mpsc::Sender<execute::ToQueue>,
+	awaiting_prepare: &mut HashMap<ArtifactId, Vec<PendingExecutionRequest>>,
 	from_handle: FromHandle,
 ) {
 	match from_handle {
@@ -208,6 +222,7 @@ async fn handle_from_handle(
 				artifacts,
 				prepare_queue,
 				execute_queue,
+				awaiting_prepare,
 				pvf,
 				params,
 				priority,
@@ -225,6 +240,7 @@ async fn handle_execute_pvf(
 	artifacts: &mut Artifacts,
 	prepare_queue: &mut mpsc::Sender<prepare::ToQueue>,
 	execute_queue: &mut mpsc::Sender<execute::ToQueue>,
+	awaiting_prepare: &mut HashMap<ArtifactId, Vec<PendingExecutionRequest>>,
 	pvf: Pvf,
 	params: Vec<u8>,
 	priority: Priority,
@@ -237,16 +253,19 @@ async fn handle_execute_pvf(
 			ArtifactState::Prepared {
 				ref artifact_path, ..
 			} => {
-				execute_queue.send(execute::ToQueue::Enqueue {
-					artifact_path: artifact_path.clone(),
-					params,
-					result_tx,
-				});
+				execute_queue
+					.send(execute::ToQueue::Enqueue {
+						artifact_path: artifact_path.clone(),
+						params,
+						result_tx,
+					})
+					.await;
 			}
-			ArtifactState::Preparing {
-				ref mut pending_requests,
-			} => {
-				pending_requests.push(PendingExecutionRequest { params, result_tx });
+			ArtifactState::Preparing => {
+				awaiting_prepare
+					.entry(artifact_id)
+					.or_default()
+					.push(PendingExecutionRequest { params, result_tx });
 			}
 		},
 		Entry::Vacant(v) => {
@@ -254,9 +273,11 @@ async fn handle_execute_pvf(
 				.send(prepare::ToQueue::Enqueue { priority, pvf })
 				.await;
 
-			v.insert(ArtifactState::Preparing {
-				pending_requests: vec![PendingExecutionRequest { params, result_tx }],
-			});
+			v.insert(ArtifactState::Preparing);
+			awaiting_prepare
+				.entry(artifact_id)
+				.or_default()
+				.push(PendingExecutionRequest { params, result_tx });
 		}
 	}
 }
@@ -271,9 +292,7 @@ async fn handle_heads_up(
 		match artifacts.artifacts.entry(artifact_id.clone()) {
 			Entry::Occupied(_) => {}
 			Entry::Vacant(v) => {
-				v.insert(ArtifactState::Preparing {
-					pending_requests: vec![],
-				});
+				v.insert(ArtifactState::Preparing);
 
 				prepare_queue
 					.send(prepare::ToQueue::Enqueue {
@@ -287,14 +306,17 @@ async fn handle_heads_up(
 }
 
 async fn handle_prepare_done(
+	cache_path: &Path,
 	artifacts: &mut Artifacts,
 	execute_queue: &mut mpsc::Sender<execute::ToQueue>,
+	awaiting_prepare: &mut HashMap<ArtifactId, Vec<PendingExecutionRequest>>,
 	artifact_id: ArtifactId,
 ) {
-	let artifact_path = artifact_id.path(&artifacts.cache_path);
+	let artifact_path = artifact_id.path(&cache_path);
 	let artifact_state = artifacts.artifacts.remove(&artifact_id).unwrap(); // TODO:
 	match artifact_state {
-		ArtifactState::Preparing { pending_requests } => {
+		ArtifactState::Preparing => {
+			let pending_requests = awaiting_prepare.remove(&artifact_id).unwrap_or_default();
 			for PendingExecutionRequest { params, result_tx } in pending_requests {
 				execute_queue
 					.send(execute::ToQueue::Enqueue {
@@ -320,98 +342,4 @@ async fn handle_prepare_done(
 struct PendingExecutionRequest {
 	params: Vec<u8>,
 	result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
-}
-
-enum ArtifactState {
-	/// The artifact is ready to be used by the executor.
-	Prepared {
-		/// The time when the artifact was the last time needed.
-		///
-		/// This is updated when we get the heads up for this artifact or when we just discover
-		/// this file.
-		last_time_needed: SystemTime,
-
-		/// The path under which the artifact is saved on the FS.
-		artifact_path: PathBuf,
-	},
-	/// A task to prepare this artifact is scheduled.
-	Preparing {
-		// TODO: Consider extracting this into a side table.
-		/// Requests that are going to be submitted for execution as soon as this artifact is ready.
-		pending_requests: Vec<PendingExecutionRequest>,
-	},
-}
-
-pub struct Artifacts {
-	cache_path: PathBuf,
-	artifacts: HashMap<ArtifactId, ArtifactState>,
-}
-
-impl Artifacts {
-	pub async fn new(cache_path: PathBuf) -> Self {
-		let artifacts = match scan_for_known_artifacts(&cache_path).await {
-			Ok(a) => a,
-			Err(_) => {
-				// TODO: warn
-				HashMap::new()
-			}
-		};
-
-		Self {
-			cache_path,
-			artifacts,
-		}
-	}
-}
-
-async fn scan_for_known_artifacts(
-	cache_path: &Path,
-) -> async_std::io::Result<HashMap<ArtifactId, ArtifactState>> {
-	let mut result = HashMap::new();
-
-	let mut dir = async_std::fs::read_dir(cache_path).await?;
-	while let Some(res) = dir.next().await {
-		let entry = res?;
-
-		if entry.file_type().await?.is_dir() {
-			// dirs do not belong to us, remove.
-			let _ = async_std::fs::remove_dir_all(entry.path()).await;
-		}
-
-		let path = entry.path();
-		let file_name = match path.file_name() {
-			None => {
-				// A file without a file name? Weird, just skip it.
-				continue;
-			}
-			Some(file_name) => file_name,
-		};
-
-		let file_name = match file_name.to_str() {
-			None => {
-				// Non unicode file name? Definitely not us.
-				let _ = async_std::fs::remove_file(&path).await;
-				continue;
-			}
-			Some(file_name) => file_name,
-		};
-
-		let artifact_id = match ArtifactId::from_file_name(file_name) {
-			None => {
-				let _ = async_std::fs::remove_file(&path).await;
-				continue;
-			}
-			Some(artifact_id) => artifact_id,
-		};
-
-		result.insert(
-			artifact_id,
-			ArtifactState::Prepared {
-				last_time_needed: SystemTime::now(),
-				artifact_path: path,
-			},
-		);
-	}
-
-	Ok(result)
 }

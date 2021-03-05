@@ -16,8 +16,9 @@
 
 use async_std::path::{Path, PathBuf};
 use polkadot_core_primitives::Hash;
-use std::{collections::HashMap};
+use std::{collections::HashMap, time::SystemTime};
 use parity_scale_codec::{Encode, Decode};
+use futures::StreamExt;
 
 #[derive(Encode, Decode)]
 pub enum Artifact {
@@ -70,6 +71,95 @@ impl ArtifactId {
 		let file_name = format!("{}{}", Self::PREFIX, self.code_hash.to_string());
 		cache_path.join(file_name)
 	}
+}
+
+pub enum ArtifactState {
+	/// The artifact is ready to be used by the executor.
+	Prepared {
+		/// The time when the artifact was the last time needed.
+		///
+		/// This is updated when we get the heads up for this artifact or when we just discover
+		/// this file.
+		last_time_needed: SystemTime,
+
+		/// The path under which the artifact is saved on the FS.
+		artifact_path: PathBuf,
+	},
+	/// A task to prepare this artifact is scheduled.
+	Preparing,
+}
+
+pub struct Artifacts {
+	// TODO: remove pub
+	pub artifacts: HashMap<ArtifactId, ArtifactState>,
+}
+
+impl Artifacts {
+	pub async fn new(cache_path: &Path) -> Self {
+		let artifacts = match scan_for_known_artifacts(cache_path).await {
+			Ok(a) => a,
+			Err(_) => {
+				// TODO: warn
+				HashMap::new()
+			}
+		};
+
+		Self {
+			artifacts,
+		}
+	}
+}
+
+async fn scan_for_known_artifacts(
+	cache_path: &Path,
+) -> async_std::io::Result<HashMap<ArtifactId, ArtifactState>> {
+	let mut result = HashMap::new();
+
+	let mut dir = async_std::fs::read_dir(cache_path).await?;
+	while let Some(res) = dir.next().await {
+		let entry = res?;
+
+		if entry.file_type().await?.is_dir() {
+			// dirs do not belong to us, remove.
+			let _ = async_std::fs::remove_dir_all(entry.path()).await;
+		}
+
+		let path = entry.path();
+		let file_name = match path.file_name() {
+			None => {
+				// A file without a file name? Weird, just skip it.
+				continue;
+			}
+			Some(file_name) => file_name,
+		};
+
+		let file_name = match file_name.to_str() {
+			None => {
+				// Non unicode file name? Definitely not us.
+				let _ = async_std::fs::remove_file(&path).await;
+				continue;
+			}
+			Some(file_name) => file_name,
+		};
+
+		let artifact_id = match ArtifactId::from_file_name(file_name) {
+			None => {
+				let _ = async_std::fs::remove_file(&path).await;
+				continue;
+			}
+			Some(artifact_id) => artifact_id,
+		};
+
+		result.insert(
+			artifact_id,
+			ArtifactState::Prepared {
+				last_time_needed: SystemTime::now(),
+				artifact_path: path,
+			},
+		);
+	}
+
+	Ok(result)
 }
 
 #[cfg(test)]
