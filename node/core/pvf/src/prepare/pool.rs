@@ -21,18 +21,34 @@ use assert_matches::assert_matches;
 
 slotmap::new_key_type! { pub struct Worker; }
 
+/// Messages that the pool handles.
 pub enum ToPool {
 	/// Request a new worker to spawn.
+	///
+	/// This request won't fail in case if the worker cannot be created. Instead, we consider
+	/// the failures transient and we try to spawn a worker after a delay.
+	///
+	/// [`FromPool::Spawned`] will be returned as soon as the worker is spawned.
+	///
+	/// The client should anticipate a [`FromPool::Rip`] message, in case the spawned worker was
+	/// stopped for some reason.
 	Spawn,
 
-	/// Kill the given worker. No-op if it's not running.
+	/// Kill the given worker. No-op if the given worker is not running.
+	///
+	/// [`FromPool::Rip`] won't be sent in this case. However, the client should be prepared to
+	/// receive [`FromPool::Rip`] nonetheless, since the worker may be have been ripped before
+	/// this message is processed.
 	Kill(Worker),
 
 	/// If the given worker was started with the background priority, then it will be raised up to
-	/// normal priority.
+	/// normal priority. Otherwise, it's no-op.
 	BumpPriority(Worker),
 
 	/// Request the given worker to start working on the given code.
+	///
+	/// Once the job either succeeded or failed, a [`FromPool::Concluded`] message will be sent back,
+	/// unless the worker died meanwhile, in which case [`FromPool::Rip`] will be sent earlier.
 	StartWork {
 		worker: Worker,
 		code: Arc<Vec<u8>>,
@@ -79,7 +95,7 @@ struct Pool {
 	mux: Mux,
 }
 
-/// A fatal error that warrants stopping the pool.
+/// A fatal error that warrants stopping the event loop of the pool.
 struct Fatal;
 
 async fn run(
@@ -147,6 +163,7 @@ fn handle_to_pool(
 						match worker::spawn(&program_path).await {
 							Ok((idle, handle)) => break PoolEvent::Spawn(idle, handle),
 							Err(err) => {
+								// TODO: Retry
 								// TODO: log
 							}
 						}
@@ -206,9 +223,8 @@ fn handle_mux(
 				idle: Some(idle),
 				handle,
 			});
-			from_pool
-				.unbounded_send(FromPool::Spawned(worker))
-				.map_err(|_| Fatal)?;
+
+			reply(from_pool, FromPool::Spawned(worker))?;
 
 			Ok(())
 		}
@@ -217,7 +233,8 @@ fn handle_mux(
 				Outcome::Concluded(idle) => {
 					let data = match spawned.get_mut(worker) {
 						None => {
-							// Perhaps the worker was killed meanwhile.
+							// Perhaps the worker was killed meanwhile and the result is no longer
+							// relevant.
 							return Ok(());
 						}
 						Some(data) => data,
@@ -228,21 +245,14 @@ fn handle_mux(
 					let old = data.idle.replace(idle);
 					assert_matches!(old, None, "attempt to overwrite an idle worker");
 
-					from_pool
-						.unbounded_send(FromPool::Concluded(worker))
-						.map_err(|_| Fatal)?;
+					reply(from_pool, FromPool::Concluded(worker))?;
 
 					Ok(())
 				}
 				Outcome::DidntMakeIt => {
-					from_pool
-						.unbounded_send(FromPool::Concluded(worker))
-						.map_err(|_| Fatal)?;
-
 					if let Some(_data) = spawned.remove(worker) {
-						from_pool
-							.unbounded_send(FromPool::Rip(worker))
-							.map_err(|_| Fatal)?;
+						reply(from_pool, FromPool::Concluded(worker))?;
+						reply(from_pool, FromPool::Rip(worker))?;
 					}
 
 					Ok(())
@@ -250,6 +260,10 @@ fn handle_mux(
 			}
 		}
 	}
+}
+
+fn reply(from_pool: &mut mpsc::UnboundedSender<FromPool>, m: FromPool) -> Result<(), Fatal> {
+	from_pool.unbounded_send(m).map_err(|_| Fatal)
 }
 
 pub fn start(
