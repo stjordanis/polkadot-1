@@ -18,13 +18,18 @@ use super::{
 	pool::{self, Worker},
 	worker,
 };
-use crate::{artifacts::ArtifactId, priority, Priority, Pvf};
+use crate::{
+	Priority, Pvf,
+	artifacts::{Artifact, ArtifactId},
+	priority,
+};
 use futures::{
 	Future, FutureExt, SinkExt,
 	channel::{mpsc, oneshot},
 	future::BoxFuture,
 	stream::{FuturesOrdered, StreamExt as _},
 };
+use slotmap::SlotMap;
 use std::{
 	collections::{HashMap, HashSet, VecDeque},
 	iter, mem,
@@ -36,15 +41,13 @@ pub enum ToQueue {
 	Enqueue { priority: Priority, pvf: Pvf },
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum FromQueue {
 	Prepared(ArtifactId),
 }
 
 #[derive(Default)]
 struct Limits {
-	/// The number of workers either live or just spawned.
-	spawned_num: usize,
-
 	/// The maximum number of workers this pool can ever host. This is expected to be a small
 	/// number, e.g. within a dozen.
 	hard_capacity: usize,
@@ -57,31 +60,40 @@ struct Limits {
 
 impl Limits {
 	/// Returns `true` if the queue is allowed to request one more worker.
-	fn can_afford_one_more(&self, critical: bool) -> bool {
+	fn can_afford_one_more(&self, spawned_num: usize, critical: bool) -> bool {
 		let cap = if critical {
 			self.hard_capacity
 		} else {
 			self.soft_capacity
 		};
-		self.spawned_num < cap
+		spawned_num < cap
 	}
 
 	/// Offer the worker back to the pool. The passed worker ID must be considered unusable unless
 	/// it wasn't taken by the pool, in which case it will be returned as `Some`.
-	fn should_cull(&mut self) -> bool {
-		self.spawned_num > self.soft_capacity
+	fn should_cull(&mut self, spawned_num: usize) -> bool {
+		spawned_num > self.soft_capacity
 	}
 }
 
-struct Job {
-	/// The artifact ID which is being prepared in the context of this job. Fixed throughout the
-	/// execution of the job.
-	artifact_id: ArtifactId,
+slotmap::new_key_type! { pub struct Job; }
 
+struct JobData {
 	/// The priority of this job. Can be bumped.
 	priority: Priority,
-
 	pvf: Pvf,
+	worker: Option<Worker>,
+}
+
+#[derive(Default)]
+struct WorkerData {
+	job: Option<Job>,
+}
+
+impl WorkerData {
+	fn is_idle(&self) -> bool {
+		self.job.is_none()
+	}
 }
 
 /// TODO:
@@ -89,30 +101,30 @@ struct Job {
 /// going to be a limited number of critical jobs and we don't really care if background starve.
 #[derive(Default)]
 struct Unscheduled {
-	background: VecDeque<Pvf>,
-	normal: VecDeque<Pvf>,
-	critical: VecDeque<Pvf>,
+	background: VecDeque<Job>,
+	normal: VecDeque<Job>,
+	critical: VecDeque<Job>,
 }
 
 impl Unscheduled {
-	fn add(&mut self, prio: Priority, pvf: Pvf) {
+	fn queue_mut(&mut self, prio: Priority) -> &mut VecDeque<Job> {
 		match prio {
-			Priority::Background => self.background.push_back(pvf),
-			Priority::Normal => self.normal.push_back(pvf),
-			Priority::Critical => self.critical.push_back(pvf),
+			Priority::Background => &mut self.background,
+			Priority::Normal => &mut self.normal,
+			Priority::Critical => &mut self.critical,
 		}
 	}
 
-	fn next(&mut self) -> Option<(Priority, Pvf)> {
-		let mut check = |prio: Priority| {
-			let q = match prio {
-				Priority::Background => &mut self.background,
-				Priority::Normal => &mut self.normal,
-				Priority::Critical => &mut self.critical,
-			};
+	fn add(&mut self, prio: Priority, job: Job) {
+		self.queue_mut(prio).push_back(job);
+	}
 
-			q.pop_front().map(|pvf| (prio, pvf))
-		};
+	fn readd(&mut self, prio: Priority, job: Job) {
+		self.queue_mut(prio).push_front(job);
+	}
+
+	fn next(&mut self) -> Option<Job> {
+		let mut check = |prio: Priority| self.queue_mut(prio).pop_front();
 		None.or_else(|| check(Priority::Critical))
 			.or_else(|| check(Priority::Normal))
 			.or_else(|| check(Priority::Background))
@@ -129,15 +141,12 @@ struct Queue {
 	cache_path: PathBuf,
 	limits: Limits,
 
-	// TODO:
-	// None means that the artifact is enqueued but is not scheduled. Some means that the worker
-	// is working on it.
-	assignments: HashMap<ArtifactId, Option<Worker>>,
+	jobs: slotmap::SlotMap<Job, JobData>,
 
-	jobs: slotmap::SecondaryMap<Worker, Job>,
-
-	/// The set of workers that were spawned but do not have any work to do.
-	idle: HashSet<Worker>,
+	/// A mapping from artifact id to a job.
+	artifact_id_to_job: HashMap<ArtifactId, Job>,
+	workers: slotmap::SparseSecondaryMap<Worker, WorkerData>,
+	spawn_inflight: usize,
 
 	/// The jobs that are not yet scheduled. These are waiting until the next `poll` where they are
 	/// processed all at once.
@@ -158,20 +167,20 @@ impl Queue {
 		from_pool_rx: mpsc::UnboundedReceiver<pool::FromPool>,
 	) -> Self {
 		Self {
-			limits: Limits {
-				spawned_num: 0,
-				soft_capacity,
-				hard_capacity,
-			},
-			assignments: HashMap::new(),
-			unscheduled: Unscheduled::default(),
-			cache_path,
 			to_queue_rx,
 			from_queue_tx,
 			to_pool_tx,
 			from_pool_rx,
-			idle: HashSet::new(),
-			jobs: slotmap::SecondaryMap::new(),
+			cache_path,
+			spawn_inflight: 0,
+			limits: Limits {
+				soft_capacity,
+				hard_capacity,
+			},
+			jobs: slotmap::SlotMap::with_key(),
+			unscheduled: Unscheduled::default(),
+			artifact_id_to_job: HashMap::new(),
+			workers: slotmap::SparseSecondaryMap::new(),
 		}
 	}
 
@@ -185,7 +194,8 @@ impl Queue {
 		}
 
 		loop {
-			futures::select! {
+			// biased to make it behave deterministically for tests.
+			futures::select_biased! {
 				ToQueue::Enqueue { pvf, priority } = self.to_queue_rx.select_next_some() =>
 					break_if_fatal!(enqueue(&mut self, priority, pvf).await),
 				from_pool = self.from_pool_rx.select_next_some() =>
@@ -195,35 +205,60 @@ impl Queue {
 	}
 }
 
-async fn enqueue(queue: &mut Queue, prio: Priority, pvf: Pvf) -> Result<(), Fatal> {
-	if let Some(&worker) = queue.assignments.get(&pvf.to_artifact_id()) {
-		// Preparation is already under way. Bump the priority if needed.
-		let job = &mut queue.jobs[worker];
-		if job.priority.is_background() && !prio.is_background() {
-			send_pool(&mut queue.to_pool_tx, pool::ToPool::BumpPriority(worker)).await?;
+async fn enqueue(queue: &mut Queue, priority: Priority, pvf: Pvf) -> Result<(), Fatal> {
+	println!("enque");
+
+	let artifact_id = pvf.to_artifact_id();
+	if let Some(&job) = queue.artifact_id_to_job.get(&artifact_id) {
+		println!("artifact is known");
+		// The artifact id is already known to the queue.
+		let mut job_data: &mut JobData = &mut queue.jobs[job];
+
+		if job_data.priority < priority {
+			// The new priority is higher. We should do two things:
+			// - if the worker was already spawned with the background prio and the new one is not
+			//   (it's already the case, if we are in this branch but we still do the check for
+			//   clarity), then we should tell the pool to bump the priority for the worker.
+			//
+			// - save the new priority in the job.
+
+			if let Some(worker) = job_data.worker {
+				if job_data.priority.is_background() && !priority.is_background() {
+					send_pool(&mut queue.to_pool_tx, pool::ToPool::BumpPriority(worker)).await?;
+				}
+			}
+
+			job_data.priority = dbg!(priority);
 		}
-		job.priority = prio;
+
 		return Ok(());
 	}
 
-	if let Some(available) = reserve_idle_worker(queue) {
+	let job = queue.jobs.insert(JobData {
+		priority,
+		pvf,
+		worker: None,
+	});
+	queue.artifact_id_to_job.insert(artifact_id, job);
+
+	if let Some(available) = find_idle_worker(queue) {
 		// TODO: Explain, why this should be fair, i.e. that the work won't be handled out of order.
-		assign(queue, available, prio, pvf).await?;
+		assign(queue, available, job).await?;
 	} else {
-		spawn_extra_worker(queue, prio.is_critical()).await?;
-		queue.unscheduled.add(prio, pvf);
+		spawn_extra_worker(queue, priority.is_critical()).await?;
+		queue.unscheduled.add(priority, job);
 	}
 
 	Ok(())
 }
 
-fn reserve_idle_worker(queue: &mut Queue) -> Option<Worker> {
-	if let Some(&free) = queue.idle.iter().next() {
-		queue.idle.remove(&free);
-		Some(free)
-	} else {
-		None
-	}
+fn find_idle_worker(queue: &mut Queue) -> Option<Worker> {
+	queue
+		.workers
+		.iter()
+		.filter(|(_, data)| data.is_idle())
+		.map(|(k, _)| k)
+		.next()
 }
 
 async fn handle_from_pool(queue: &mut Queue, from_pool: pool::FromPool) -> Result<(), Fatal> {
@@ -237,92 +272,109 @@ async fn handle_from_pool(queue: &mut Queue, from_pool: pool::FromPool) -> Resul
 }
 
 async fn handle_worker_spawned(queue: &mut Queue, worker: Worker) -> Result<(), Fatal> {
-	if let Some((prio, pvf)) = queue.unscheduled.next() {
-		assign(queue, worker, prio, pvf).await?;
-	} else {
-		queue.idle.insert(worker);
+	queue.workers.insert(worker, WorkerData::default());
+	queue.spawn_inflight -= 1;
+
+	if let Some(job) = queue.unscheduled.next() {
+		dbg!(&job);
+		assign(queue, worker, job).await?;
 	}
+
 	Ok(())
 }
 
 async fn handle_worker_concluded(queue: &mut Queue, worker: Worker) -> Result<(), Fatal> {
-	let job = queue
-		.jobs
-		.remove(worker)
-		.take()
-		.expect("the worker was assigned so it should have had job; qed");
+	let job = match queue.workers.get_mut(worker) {
+		None => {
+			// TODO: a worker concluded which doesn't belong to this queue
+			return Ok(());
+		}
+		Some(worker_data) => {
+			match worker_data.job.take() {
+				None => {
+					// TODO: a worker that didn't have job concluded
+					return Ok(());
+				}
+				Some(job) => job,
+			}
+		}
+	};
 
-	let _ = queue.assignments.remove(&job.artifact_id);
-	let artifact_id = job.artifact_id;
+	let job_data = queue.jobs.remove(job).unwrap(); // TODO: this should be always some
+	let artifact_id = job_data.pvf.to_artifact_id();
+	queue.artifact_id_to_job.remove(&artifact_id);
 
-	if queue.limits.should_cull() {
+	reply(&mut queue.from_queue_tx, FromQueue::Prepared(artifact_id))?;
+
+	if queue
+		.limits
+		.should_cull(queue.workers.len() + queue.spawn_inflight)
+	{
 		// We no longer need services of this worker. Kill it.
+		queue.workers.remove(worker);
 		send_pool(&mut queue.to_pool_tx, pool::ToPool::Kill(worker)).await?;
 	} else {
 		// see if there are more work available and schedule it.
-		if let Some((prio, pvf)) = queue.unscheduled.next() {
-			assign(queue, worker, prio, pvf).await?;
-		} else {
-			queue.idle.insert(worker);
+		if let Some(job) = queue.unscheduled.next() {
+			assign(queue, worker, job).await?;
 		}
-
-		reply(&mut queue.from_queue_tx, FromQueue::Prepared(artifact_id))?;
 	}
 
 	Ok(())
 }
 
 async fn handle_worker_rip(queue: &mut Queue, worker: Worker) -> Result<(), Fatal> {
-	queue.limits.spawned_num -= 1;
-	queue.idle.remove(&worker);
+	let worker = match queue.workers.remove(worker) {
+		None => {
+			// That's fine. This can happen when we wanted to kill the worker but it died naturally
+			// before us receiving the message.
+			return Ok(());
+		}
+		Some(w) => w,
+	};
 
-	if let Some(Job {
-		artifact_id,
-		priority,
-		pvf,
-	}) = queue.jobs.remove(worker)
-	{
-		queue.assignments.remove(&artifact_id);
-		queue.unscheduled.add(priority, pvf);
+	if let Some(job) = worker.job {
+		let job_data = &mut queue.jobs[job];
+
+		queue.unscheduled.readd(job_data.priority, job);
+
+		// Spawn another worker to replace the ripped one. That unconditionally is not critical
+		// even though the job might have been, just to not accidentally fill up the whole pool.
+		spawn_extra_worker(queue, false).await?;
 	}
-
-	// Spawn another worker to replace the ripped one. That unconditionally is not critical
-	// even though the job might have been, just to not accidentally fill up the whole pool.
-	spawn_extra_worker(queue, false).await?;
 
 	Ok(())
 }
 
 async fn spawn_extra_worker(queue: &mut Queue, critical: bool) -> Result<(), Fatal> {
-	if queue.limits.can_afford_one_more(critical) {
-		queue.limits.spawned_num += 1;
+	if queue
+		.limits
+		.can_afford_one_more(queue.workers.len() + queue.spawn_inflight, critical)
+	{
+		queue.spawn_inflight += 1;
 		send_pool(&mut queue.to_pool_tx, pool::ToPool::Spawn).await?;
 	}
 
 	Ok(())
 }
 
-async fn assign(queue: &mut Queue, worker: Worker, prio: Priority, pvf: Pvf) -> Result<(), Fatal> {
-	let artifact_id = pvf.to_artifact_id();
+async fn assign(queue: &mut Queue, worker: Worker, job: Job) -> Result<(), Fatal> {
+	let job_data = &mut queue.jobs[job];
+
+	let artifact_id = job_data.pvf.to_artifact_id();
 	let artifact_path = artifact_id.path(&queue.cache_path);
 
-	queue.assignments.insert(artifact_id.clone(), Some(worker));
-	queue.jobs.insert(
-		worker,
-		Job {
-			artifact_id,
-			priority: prio,
-			pvf: pvf.clone(),
-		},
-	);
+	job_data.worker = dbg!(Some(worker));
+
+	queue.workers[worker].job = Some(job);
 
 	send_pool(
 		&mut queue.to_pool_tx,
 		pool::ToPool::StartWork {
 			worker,
-			code: pvf.code,
+			code: job_data.pvf.code.clone(),
 			artifact_path,
-			background_priority: prio.is_background(),
+			background_priority: dbg!(job_data.priority.is_background()),
 		},
 	)
 	.await?;
@@ -377,59 +429,239 @@ pub fn start(
 
 #[cfg(test)]
 mod tests {
+	use std::task::Context;
 	use slotmap::SlotMap;
-
-    use super::*;
+	use assert_matches::assert_matches;
+	use futures::FutureExt;
+	use super::*;
 
 	// TODO: respects priority for unscheduled
-	// TODO: bumps priority if needed
-	// TODO: doesn't exceed the hard limit unless needed
 	// TODO: immune to rips
 
+	/// Creates a new pvf which artifact id can be uniquely identified by the given number.
 	fn pvf(descriminator: u32) -> Pvf {
 		let d_buf = descriminator.to_le_bytes();
 		Pvf::from_code(&d_buf)
 	}
 
+	async fn run_until<R>(
+		task: &mut (impl Future<Output = ()> + Unpin),
+		mut fut: (impl Future<Output = R> + Unpin),
+	) -> R {
+		let cx = Context::from_waker(futures::task::noop_waker_ref());
+		let start = std::time::Instant::now();
+
+		let mut fut = &mut fut;
+		loop {
+			if start.elapsed() > std::time::Duration::from_secs(1) {
+				// We expect that this will take only a couple of iterations and thus to take way
+				// less than a second.
+				panic!("timeout");
+			}
+
+			if let Poll::Ready(r) = futures::poll!(&mut *fut) {
+				break r;
+			}
+
+			if futures::poll!(&mut *task).is_ready() {
+				panic!()
+			}
+		}
+	}
+
+	struct Test {
+		_tempdir: tempfile::TempDir,
+		run: BoxFuture<'static, ()>,
+		workers: SlotMap<Worker, ()>,
+		from_pool_tx: mpsc::UnboundedSender<pool::FromPool>,
+		to_pool_rx: mpsc::Receiver<pool::ToPool>,
+		to_queue_tx: mpsc::Sender<ToQueue>,
+		from_queue_rx: mpsc::UnboundedReceiver<FromQueue>,
+	}
+
+	impl Test {
+		fn new(soft_capacity: usize, hard_capacity: usize) -> Self {
+			let tempdir = tempfile::tempdir().unwrap();
+
+			let (to_pool_tx, to_pool_rx) = mpsc::channel(10);
+			let (from_pool_tx, from_pool_rx) = mpsc::unbounded();
+
+			let workers: SlotMap<Worker, ()> = SlotMap::with_key();
+
+			let (to_queue_tx, from_queue_rx, run) = start(
+				soft_capacity,
+				hard_capacity,
+				tempdir.path().to_owned().into(),
+				to_pool_tx,
+				from_pool_rx,
+			);
+
+			Self {
+				_tempdir: tempdir,
+				run: run.boxed(),
+				workers,
+				from_pool_tx,
+				to_pool_rx,
+				to_queue_tx,
+				from_queue_rx,
+			}
+		}
+
+		fn send_queue(&mut self, to_queue: ToQueue) {
+			self.to_queue_tx
+				.send(to_queue)
+				.now_or_never()
+				.unwrap()
+				.unwrap();
+		}
+
+		async fn poll_and_recv_from_queue(&mut self) -> FromQueue {
+			let from_queue_rx = &mut self.from_queue_rx;
+			run_until(
+				&mut self.run,
+				async { from_queue_rx.next().await.unwrap() }.boxed(),
+			)
+			.await
+		}
+
+		fn send_from_pool(&mut self, from_pool: pool::FromPool) {
+			self.from_pool_tx
+				.send(from_pool)
+				.now_or_never()
+				.unwrap()
+				.unwrap();
+		}
+
+		async fn poll_and_recv_to_pool(&mut self) -> pool::ToPool {
+			let to_pool_rx = &mut self.to_pool_rx;
+			run_until(
+				&mut self.run,
+				async { to_pool_rx.next().await.unwrap() }.boxed(),
+			)
+			.await
+		}
+	}
+
+	#[async_std::test]
+	async fn properly_concludes() {
+		let mut test = Test::new(2, 2);
+
+		test.send_queue(ToQueue::Enqueue {
+			priority: Priority::Background,
+			pvf: pvf(1),
+		});
+		assert_eq!(test.poll_and_recv_to_pool().await, pool::ToPool::Spawn);
+
+		let w = test.workers.insert(());
+		test.send_from_pool(pool::FromPool::Spawned(w));
+		test.send_from_pool(pool::FromPool::Concluded(w));
+
+		assert_eq!(
+			test.poll_and_recv_from_queue().await,
+			FromQueue::Prepared(pvf(1).to_artifact_id())
+		);
+	}
+
+	#[async_std::test]
+	async fn dont_spawn_over_soft_limit_unless_critical() {
+		let mut test = Test::new(2, 3);
+
+		test.send_queue(ToQueue::Enqueue {
+			priority: Priority::Normal,
+			pvf: pvf(1),
+		});
+		test.send_queue(ToQueue::Enqueue {
+			priority: Priority::Normal,
+			pvf: pvf(2),
+		});
+		test.send_queue(ToQueue::Enqueue {
+			priority: Priority::Normal,
+			pvf: pvf(3),
+		});
+
+		// Receive only two spawns.
+		assert_eq!(test.poll_and_recv_to_pool().await, pool::ToPool::Spawn);
+		assert_eq!(test.poll_and_recv_to_pool().await, pool::ToPool::Spawn);
+
+		let w1 = test.workers.insert(());
+		let w2 = test.workers.insert(());
+
+		test.send_from_pool(pool::FromPool::Spawned(w1));
+		test.send_from_pool(pool::FromPool::Spawned(w2));
+
+		// Get two start works.
+		assert_matches!(test.poll_and_recv_to_pool().await, pool::ToPool::StartWork { .. });
+		assert_matches!(test.poll_and_recv_to_pool().await, pool::ToPool::StartWork { .. });
+
+		test.send_from_pool(pool::FromPool::Concluded(w1));
+
+		assert_matches!(test.poll_and_recv_to_pool().await, pool::ToPool::StartWork { .. });
+
+		// Enqueue a critical job.
+		test.send_queue(ToQueue::Enqueue {
+			priority: Priority::Critical,
+			pvf: pvf(4),
+		});
+
+		// 2 out of 2 are working, but there is a critical job incoming. That means that spawning
+		// another worker is warranted.
+		assert_eq!(test.poll_and_recv_to_pool().await, pool::ToPool::Spawn);
+	}
+
+	#[async_std::test]
+	async fn cull_unwanted() {
+		let mut test = Test::new(1, 2);
+
+		test.send_queue(ToQueue::Enqueue {
+			priority: Priority::Normal,
+			pvf: pvf(1),
+		});
+		assert_eq!(test.poll_and_recv_to_pool().await, pool::ToPool::Spawn);
+		let w1 = test.workers.insert(());
+		test.send_from_pool(pool::FromPool::Spawned(w1));
+		assert_matches!(test.poll_and_recv_to_pool().await, pool::ToPool::StartWork { .. });
+
+		// Enqueue a critical job, which warrants spawning over the soft limit.
+		test.send_queue(ToQueue::Enqueue {
+			priority: Priority::Critical,
+			pvf: pvf(2),
+		});
+		assert_eq!(test.poll_and_recv_to_pool().await, pool::ToPool::Spawn);
+
+		// However, before the new worker had a chance to spawn, the first worker finishes with its
+		// job. The old worker will be killed while the new worker will be let live, even though
+		// it's not instantiated.
+		//
+		// That's a bit silly in this context, but in production there will be an entire pool up
+		// to the `soft_capacity` of workers and it doesn't matter which one to cull. Either way,
+		// we just check that edge case of an edge case works.
+		test.send_from_pool(pool::FromPool::Concluded(w1));
+		assert_matches!(test.poll_and_recv_to_pool().await, pool::ToPool::Kill(w1));
+	}
+
 	#[async_std::test]
 	async fn bump_prio_on_urgency_change() {
-		let tempdir = tempfile::tempdir().unwrap();
+		let mut test = Test::new(2, 2);
 
-		let (to_pool_tx, mut to_pool_rx) = mpsc::channel(10);
-		let (mut from_pool_tx, from_pool_rx) = mpsc::unbounded();
+		test.send_queue(ToQueue::Enqueue {
+			priority: Priority::Background,
+			pvf: pvf(1),
+		});
 
-		let mut workers: SlotMap<Worker, ()> = SlotMap::with_key();
+		assert_eq!(test.poll_and_recv_to_pool().await, pool::ToPool::Spawn);
 
-		let (mut to_queue_tx, from_queue_rx, run) =
-			start(2, 2, tempdir.path().to_owned().into(), to_pool_tx, from_pool_rx);
+		let w = test.workers.insert(());
+		test.send_from_pool(pool::FromPool::Spawned(w));
 
-		let mut event_loop = async_std::task::spawn(run);
-
-		to_queue_tx
-			.send(ToQueue::Enqueue {
-				priority: Priority::Background,
-				pvf: pvf(1),
-			})
-			.await;
-
-		assert_eq!(
-			to_pool_rx.select_next_some().await,
-			pool::ToPool::Spawn
-		);
-
-		let w = workers.insert(());
-		from_pool_tx.send(pool::FromPool::Spawned(w));
-
-		to_queue_tx
-			.send(ToQueue::Enqueue {
-				priority: Priority::Normal,
-				pvf: pvf(1),
-			})
-			.await;
+		assert_matches!(test.poll_and_recv_to_pool().await, pool::ToPool::StartWork { .. });
+		test.send_queue(ToQueue::Enqueue {
+			priority: Priority::Normal,
+			pvf: pvf(1),
+		});
 
 		assert_eq!(
-			to_pool_rx.select_next_some().await,
-			pool::ToPool::BumpPriority(w),
+			test.poll_and_recv_to_pool().await,
+			pool::ToPool::BumpPriority(w)
 		);
 	}
 }
