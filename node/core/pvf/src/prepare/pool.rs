@@ -38,6 +38,7 @@ use assert_matches::assert_matches;
 slotmap::new_key_type! { pub struct Worker; }
 
 /// Messages that the pool handles.
+#[derive(Debug, PartialEq, Eq)]
 pub enum ToPool {
 	/// Request a new worker to spawn.
 	///

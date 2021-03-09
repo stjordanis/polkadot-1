@@ -80,6 +80,43 @@ struct Job {
 
 	/// The priority of this job. Can be bumped.
 	priority: Priority,
+
+	pvf: Pvf,
+}
+
+/// TODO:
+/// This structure is prone to starving, however, we don't care that much since we expect there is
+/// going to be a limited number of critical jobs and we don't really care if background starve.
+#[derive(Default)]
+struct Unscheduled {
+	background: VecDeque<Pvf>,
+	normal: VecDeque<Pvf>,
+	critical: VecDeque<Pvf>,
+}
+
+impl Unscheduled {
+	fn add(&mut self, prio: Priority, pvf: Pvf) {
+		match prio {
+			Priority::Background => self.background.push_back(pvf),
+			Priority::Normal => self.normal.push_back(pvf),
+			Priority::Critical => self.critical.push_back(pvf),
+		}
+	}
+
+	fn next(&mut self) -> Option<(Priority, Pvf)> {
+		let mut check = |prio: Priority| {
+			let q = match prio {
+				Priority::Background => &mut self.background,
+				Priority::Normal => &mut self.normal,
+				Priority::Critical => &mut self.critical,
+			};
+
+			q.pop_front().map(|pvf| (prio, pvf))
+		};
+		None.or_else(|| check(Priority::Critical))
+			.or_else(|| check(Priority::Normal))
+			.or_else(|| check(Priority::Background))
+	}
 }
 
 struct Queue {
@@ -91,7 +128,12 @@ struct Queue {
 
 	cache_path: PathBuf,
 	limits: Limits,
-	assignments: HashMap<ArtifactId, Worker>,
+
+	// TODO:
+	// None means that the artifact is enqueued but is not scheduled. Some means that the worker
+	// is working on it.
+	assignments: HashMap<ArtifactId, Option<Worker>>,
+
 	jobs: slotmap::SecondaryMap<Worker, Job>,
 
 	/// The set of workers that were spawned but do not have any work to do.
@@ -99,7 +141,7 @@ struct Queue {
 
 	/// The jobs that are not yet scheduled. These are waiting until the next `poll` where they are
 	/// processed all at once.
-	unscheduled: Vec<(Priority, Pvf)>,
+	unscheduled: Unscheduled,
 }
 
 /// A fatal error that warrants stopping the queue.
@@ -122,7 +164,7 @@ impl Queue {
 				hard_capacity,
 			},
 			assignments: HashMap::new(),
-			unscheduled: Vec::new(),
+			unscheduled: Unscheduled::default(),
 			cache_path,
 			to_queue_rx,
 			from_queue_tx,
@@ -158,11 +200,7 @@ async fn enqueue(queue: &mut Queue, prio: Priority, pvf: Pvf) -> Result<(), Fata
 		// Preparation is already under way. Bump the priority if needed.
 		let job = &mut queue.jobs[worker];
 		if job.priority.is_background() && !prio.is_background() {
-			queue
-				.to_pool_tx
-				.send(pool::ToPool::BumpPriority(worker))
-				.await
-				.map_err(|_| Fatal)?;
+			send_pool(&mut queue.to_pool_tx, pool::ToPool::BumpPriority(worker)).await?;
 		}
 		job.priority = prio;
 		return Ok(());
@@ -173,7 +211,7 @@ async fn enqueue(queue: &mut Queue, prio: Priority, pvf: Pvf) -> Result<(), Fata
 		assign(queue, available, prio, pvf).await?;
 	} else {
 		spawn_extra_worker(queue, prio.is_critical()).await?;
-		queue.unscheduled.push((prio, pvf));
+		queue.unscheduled.add(prio, pvf);
 	}
 
 	Ok(())
@@ -199,7 +237,7 @@ async fn handle_from_pool(queue: &mut Queue, from_pool: pool::FromPool) -> Resul
 }
 
 async fn handle_worker_spawned(queue: &mut Queue, worker: Worker) -> Result<(), Fatal> {
-	if let Some((prio, pvf)) = next_unscheduled(&mut queue.unscheduled) {
+	if let Some((prio, pvf)) = queue.unscheduled.next() {
 		assign(queue, worker, prio, pvf).await?;
 	} else {
 		queue.idle.insert(worker);
@@ -222,7 +260,7 @@ async fn handle_worker_concluded(queue: &mut Queue, worker: Worker) -> Result<()
 		send_pool(&mut queue.to_pool_tx, pool::ToPool::Kill(worker)).await?;
 	} else {
 		// see if there are more work available and schedule it.
-		if let Some((prio, pvf)) = next_unscheduled(&mut queue.unscheduled) {
+		if let Some((prio, pvf)) = queue.unscheduled.next() {
 			assign(queue, worker, prio, pvf).await?;
 		} else {
 			queue.idle.insert(worker);
@@ -238,9 +276,14 @@ async fn handle_worker_rip(queue: &mut Queue, worker: Worker) -> Result<(), Fata
 	queue.limits.spawned_num -= 1;
 	queue.idle.remove(&worker);
 
-	if let Some(Job { artifact_id, .. }) = queue.jobs.remove(worker) {
+	if let Some(Job {
+		artifact_id,
+		priority,
+		pvf,
+	}) = queue.jobs.remove(worker)
+	{
 		queue.assignments.remove(&artifact_id);
-		// TODO: reschedule the job?
+		queue.unscheduled.add(priority, pvf);
 	}
 
 	// Spawn another worker to replace the ripped one. That unconditionally is not critical
@@ -263,12 +306,13 @@ async fn assign(queue: &mut Queue, worker: Worker, prio: Priority, pvf: Pvf) -> 
 	let artifact_id = pvf.to_artifact_id();
 	let artifact_path = artifact_id.path(&queue.cache_path);
 
-	queue.assignments.insert(artifact_id.clone(), worker);
+	queue.assignments.insert(artifact_id.clone(), Some(worker));
 	queue.jobs.insert(
 		worker,
 		Job {
 			artifact_id,
 			priority: prio,
+			pvf: pvf.clone(),
 		},
 	);
 
@@ -303,11 +347,6 @@ async fn send_pool(
 	})
 }
 
-fn next_unscheduled(unscheduled: &mut Vec<(Priority, Pvf)>) -> Option<(Priority, Pvf)> {
-	// TODO: Respect priority
-	unscheduled.pop()
-}
-
 pub fn start(
 	soft_capacity: usize,
 	hard_capacity: usize,
@@ -334,4 +373,63 @@ pub fn start(
 	.run();
 
 	(to_queue_tx, from_queue_rx, run)
+}
+
+#[cfg(test)]
+mod tests {
+	use slotmap::SlotMap;
+
+    use super::*;
+
+	// TODO: respects priority for unscheduled
+	// TODO: bumps priority if needed
+	// TODO: doesn't exceed the hard limit unless needed
+	// TODO: immune to rips
+
+	fn pvf(descriminator: u32) -> Pvf {
+		let d_buf = descriminator.to_le_bytes();
+		Pvf::from_code(&d_buf)
+	}
+
+	#[async_std::test]
+	async fn bump_prio_on_urgency_change() {
+		let tempdir = tempfile::tempdir().unwrap();
+
+		let (to_pool_tx, mut to_pool_rx) = mpsc::channel(10);
+		let (mut from_pool_tx, from_pool_rx) = mpsc::unbounded();
+
+		let mut workers: SlotMap<Worker, ()> = SlotMap::with_key();
+
+		let (mut to_queue_tx, from_queue_rx, run) =
+			start(2, 2, tempdir.path().to_owned().into(), to_pool_tx, from_pool_rx);
+
+		let mut event_loop = async_std::task::spawn(run);
+
+		to_queue_tx
+			.send(ToQueue::Enqueue {
+				priority: Priority::Background,
+				pvf: pvf(1),
+			})
+			.await;
+
+		assert_eq!(
+			to_pool_rx.select_next_some().await,
+			pool::ToPool::Spawn
+		);
+
+		let w = workers.insert(());
+		from_pool_tx.send(pool::FromPool::Spawned(w));
+
+		to_queue_tx
+			.send(ToQueue::Enqueue {
+				priority: Priority::Normal,
+				pvf: pvf(1),
+			})
+			.await;
+
+		assert_eq!(
+			to_pool_rx.select_next_some().await,
+			pool::ToPool::BumpPriority(w),
+		);
+	}
 }

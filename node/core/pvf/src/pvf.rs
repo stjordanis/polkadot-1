@@ -20,6 +20,9 @@ use sp_core::keccak_256;
 use std::sync::Arc;
 
 /// A struct that carries code of a parachain validation function and it's hash.
+///
+/// Should be cheap to clone.
+#[derive(Clone)]
 pub struct Pvf {
 	pub(crate) code: Arc<Vec<u8>>,
 	pub(crate) code_hash: Hash,
