@@ -68,12 +68,13 @@ impl ValidationHost {
 		})?
 	}
 
-	pub async fn heads_up(&mut self, active_pvfs: Vec<Pvf>) {
+	pub async fn heads_up(&mut self, active_pvfs: Vec<Pvf>) -> Result<(), String> {
 		self.from_handle_tx
 			.lock()
 			.await
 			.send(FromHandle::HeadsUp { active_pvfs })
-			.await;
+			.await
+			.map_err(|_| format!("the inner loop hung up"))
 	}
 }
 
@@ -152,6 +153,8 @@ struct Inner {
 	awaiting_prepare: HashMap<ArtifactId, Vec<PendingExecutionRequest>>,
 }
 
+struct Fatal;
+
 async fn run(
 	Inner {
 		cache_path,
@@ -166,6 +169,14 @@ async fn run(
 	prepare_queue: impl Future<Output = ()> + Unpin,
 	execute_queue: impl Future<Output = ()> + Unpin,
 ) {
+	macro_rules! break_if_fatal {
+		($expr:expr) => {
+			if let Err(Fatal) = $expr {
+				break;
+				}
+		};
+	}
+
 	let mut from_handle_rx = from_handle_rx.fuse();
 	let mut from_prepare_queue_rx = from_prepare_queue_rx.fuse();
 	let mut prepare_queue = prepare_queue.fuse();
@@ -184,14 +195,14 @@ async fn run(
 				panic!()
 			}
 			from_handle = from_handle_rx.select_next_some() => {
-				handle_from_handle(
+				break_if_fatal!(handle_from_handle(
 					&mut artifacts,
 					&mut to_prepare_queue_tx,
 					&mut to_execute_queue_tx,
 					&mut awaiting_prepare,
 					from_handle,
 				)
-				.await;
+				.await);
 			},
 			prepare::FromQueue::Prepared(artifact_id) = from_prepare_queue_rx.select_next_some() => {
 				// Note that preparation always succeeds.
@@ -203,13 +214,13 @@ async fn run(
 				//
 				// We could be eager in terms of reporting and plumb the result from the prepartion
 				// worker but we don't for the sake of simplicity.
-				handle_prepare_done(
+				break_if_fatal!(handle_prepare_done(
 					&cache_path,
 					&mut artifacts,
 					&mut to_execute_queue_tx,
 					&mut awaiting_prepare,
 					artifact_id,
-				).await;
+				).await);
 			},
 		}
 	}
@@ -221,7 +232,7 @@ async fn handle_from_handle(
 	execute_queue: &mut mpsc::Sender<execute::ToQueue>,
 	awaiting_prepare: &mut HashMap<ArtifactId, Vec<PendingExecutionRequest>>,
 	from_handle: FromHandle,
-) {
+) -> Result<(), Fatal> {
 	match from_handle {
 		FromHandle::ExecutePvf {
 			pvf,
@@ -239,12 +250,14 @@ async fn handle_from_handle(
 				priority,
 				result_tx,
 			)
-			.await;
+			.await?;
 		}
 		FromHandle::HeadsUp { active_pvfs } => {
-			handle_heads_up(artifacts, prepare_queue, active_pvfs).await;
+			handle_heads_up(artifacts, prepare_queue, active_pvfs).await?;
 		}
 	}
+
+	Ok(())
 }
 
 async fn handle_execute_pvf(
@@ -256,7 +269,7 @@ async fn handle_execute_pvf(
 	params: Vec<u8>,
 	priority: Priority,
 	result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
-) {
+) -> Result<(), Fatal> {
 	let artifact_id = pvf.to_artifact_id();
 
 	match artifacts.artifacts.entry(artifact_id.clone()) {
@@ -270,7 +283,8 @@ async fn handle_execute_pvf(
 						params,
 						result_tx,
 					})
-					.await;
+					.await
+					.map_err(|_| Fatal)?;
 			}
 			ArtifactState::Preparing => {
 				awaiting_prepare
@@ -282,7 +296,8 @@ async fn handle_execute_pvf(
 		Entry::Vacant(v) => {
 			prepare_queue
 				.send(prepare::ToQueue::Enqueue { priority, pvf })
-				.await;
+				.await
+				.map_err(|_| Fatal)?;
 
 			v.insert(ArtifactState::Preparing);
 			awaiting_prepare
@@ -291,13 +306,15 @@ async fn handle_execute_pvf(
 				.push(PendingExecutionRequest { params, result_tx });
 		}
 	}
+
+	Ok(())
 }
 
 async fn handle_heads_up(
 	artifacts: &mut Artifacts,
 	prepare_queue: &mut mpsc::Sender<prepare::ToQueue>,
 	active_pvfs: Vec<Pvf>,
-) {
+) -> Result<(), Fatal> {
 	for active_pvf in active_pvfs {
 		let artifact_id = active_pvf.to_artifact_id();
 		match artifacts.artifacts.entry(artifact_id.clone()) {
@@ -310,10 +327,13 @@ async fn handle_heads_up(
 						priority: Priority::Background,
 						pvf: active_pvf,
 					})
-					.await;
+					.await
+					.map_err(|_| Fatal)?;
 			}
 		}
 	}
+
+	Ok(())
 }
 
 async fn handle_prepare_done(
@@ -322,7 +342,7 @@ async fn handle_prepare_done(
 	execute_queue: &mut mpsc::Sender<execute::ToQueue>,
 	awaiting_prepare: &mut HashMap<ArtifactId, Vec<PendingExecutionRequest>>,
 	artifact_id: ArtifactId,
-) {
+) -> Result<(), Fatal> {
 	let artifact_path = artifact_id.path(&cache_path);
 	let artifact_state = artifacts.artifacts.remove(&artifact_id).unwrap(); // TODO:
 	match artifact_state {
@@ -335,7 +355,8 @@ async fn handle_prepare_done(
 						params,
 						result_tx,
 					})
-					.await;
+					.await
+					.map_err(|_| Fatal)?;
 			}
 		}
 		_ => panic!(), // TODO:
@@ -348,6 +369,8 @@ async fn handle_prepare_done(
 			artifact_path,
 		},
 	);
+
+	Ok(())
 }
 
 struct PendingExecutionRequest {
