@@ -19,18 +19,13 @@ use async_std::{
 	os::unix::net::{UnixListener, UnixStream},
 	path::{PathBuf, Path},
 };
-use futures::{
-	AsyncRead, AsyncWrite, AsyncReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _,
-	channel::mpsc,
-};
+use futures::{AsyncRead, AsyncWrite, AsyncReadExt as _, AsyncWriteExt as _, FutureExt as _};
 use futures_timer::Delay;
 use rand::Rng;
 use std::{
-	borrow::Cow,
 	mem,
 	pin::Pin,
-	str::{FromStr, from_utf8},
-	sync::Arc,
+	str::FromStr,
 	task::{Context, Poll},
 	time::Duration,
 };
@@ -47,7 +42,7 @@ pub async fn spawn_with_program_path(
 		.await
 		.map_err(|_| SpawnErr::Bind)?;
 
-	let mut handle = WorkerHandle::spawn(&*program_path, extra_args, &socket_path)
+	let handle = WorkerHandle::spawn(&*program_path, extra_args, &socket_path)
 		.map_err(|_| SpawnErr::ProcessSpawn)?;
 
 	futures::select! {
@@ -62,7 +57,6 @@ pub async fn spawn_with_program_path(
 }
 
 pub fn tmpfile(prefix: &str) -> PathBuf {
-	use std::ffi::OsString;
 	use rand::distributions::Alphanumeric;
 
 	const DESCRIMINATOR_LEN: usize = 10;
@@ -162,8 +156,6 @@ impl futures::Future for WorkerHandle {
 	type Output = ();
 
 	fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-		use futures_lite::io::AsyncRead;
-
 		let me = self.project();
 		match futures::ready!(AsyncRead::poll_read(me.stdout, cx, &mut *me.drop_box)) {
 			Ok(0) => {

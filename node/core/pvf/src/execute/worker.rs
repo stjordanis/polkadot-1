@@ -29,7 +29,7 @@ use async_std::{
 };
 use futures::FutureExt;
 use futures_timer::Delay;
-use polkadot_parachain::{primitives::ValidationResult, wasm_executor::ValidationError};
+use polkadot_parachain::primitives::ValidationResult;
 use parity_scale_codec::{Encode, Decode};
 
 pub async fn spawn(program_path: &Path) -> Result<(IdleWorker, WorkerHandle), SpawnErr> {
@@ -112,8 +112,12 @@ async fn send_response(stream: &mut UnixStream, response: Response) -> io::Resul
 
 async fn recv_response(stream: &mut UnixStream) -> io::Result<Response> {
 	let response_bytes = framed_recv(stream).await?;
-	let response = Response::decode(&mut &response_bytes[..])
-		.map_err(|e| io::Error::new(io::ErrorKind::Other, "response decode error"))?;
+	let response = Response::decode(&mut &response_bytes[..]).map_err(|e| {
+		io::Error::new(
+			io::ErrorKind::Other,
+			format!("response decode error: {:?}", e),
+		)
+	})?;
 	Ok(response)
 }
 

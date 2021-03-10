@@ -21,7 +21,6 @@ use crate::{
 };
 use std::{
 	collections::{HashMap, hash_map::Entry},
-	sync::Arc,
 	time::SystemTime,
 };
 use async_std::{
@@ -35,10 +34,7 @@ use polkadot_parachain::{
 use futures::{
 	Future, FutureExt, SinkExt, StreamExt,
 	channel::{mpsc, oneshot},
-	future::BoxFuture,
-	stream::FuturesUnordered,
 };
-use polkadot_core_primitives::Hash;
 
 pub struct ValidationHost {
 	from_handle_tx: Mutex<mpsc::Sender<FromHandle>>,

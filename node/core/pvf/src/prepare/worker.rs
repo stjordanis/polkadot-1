@@ -15,7 +15,6 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::{
-	Priority,
 	artifacts::Artifact,
 	worker_common::{
 		IdleWorker, SpawnErr, WorkerHandle, bytes_to_path, framed_recv, framed_send, path_to_bytes,
@@ -24,25 +23,12 @@ use crate::{
 };
 use async_std::{
 	io,
-	os::unix::net::{UnixListener, UnixStream},
+	os::unix::net::UnixStream,
 	path::{PathBuf, Path},
 };
-use futures::{
-	AsyncRead, AsyncWrite, AsyncReadExt as _, AsyncWriteExt as _, FutureExt as _, StreamExt as _,
-	channel::mpsc,
-};
+use futures::FutureExt as _;
 use futures_timer::Delay;
-use rand::Rng;
-use std::{
-	borrow::Cow,
-	mem,
-	pin::Pin,
-	str::{FromStr, from_utf8},
-	sync::Arc,
-	task::{Context, Poll},
-	time::Duration,
-};
-use pin_project::pin_project;
+use std::{sync::Arc, time::Duration};
 
 const NICENESS_BACKGROUND: i32 = 5;
 const NICENESS_FOREGROUND: i32 = 0;
@@ -78,6 +64,7 @@ pub async fn start_work(
 	}
 
 	if let Err(err) = send_request(&mut stream, code).await {
+		drop(err);
 		// TODO: Log
 		return Outcome::DidntMakeIt;
 	}

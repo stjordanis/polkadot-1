@@ -15,7 +15,6 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 use async_std::path::PathBuf;
-use futures::future::join;
 use polkadot_node_core_pvf::{Pvf, ValidationHost, start};
 use polkadot_parachain::{
 	primitives::{BlockData, ValidationParams, ValidationResult},

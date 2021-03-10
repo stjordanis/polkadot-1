@@ -16,25 +16,10 @@
 
 use super::{
 	pool::{self, Worker},
-	worker,
 };
-use crate::{
-	Priority, Pvf,
-	artifacts::{Artifact, ArtifactId},
-	priority,
-};
-use futures::{
-	Future, FutureExt, SinkExt,
-	channel::{mpsc, oneshot},
-	future::BoxFuture,
-	stream::{FuturesOrdered, StreamExt as _},
-};
-use slotmap::SlotMap;
-use std::{
-	collections::{HashMap, HashSet, VecDeque},
-	iter, mem,
-	task::Poll,
-};
+use crate::{Priority, Pvf, artifacts::ArtifactId};
+use futures::{Future, SinkExt, channel::mpsc, stream::StreamExt as _};
+use std::collections::{HashMap, VecDeque};
 use async_std::path::PathBuf;
 
 pub enum ToQueue {
@@ -429,10 +414,10 @@ pub fn start(
 
 #[cfg(test)]
 mod tests {
-	use std::task::Context;
 	use slotmap::SlotMap;
 	use assert_matches::assert_matches;
-	use futures::FutureExt;
+	use futures::{FutureExt, future::BoxFuture};
+	use std::task::Poll;
 	use super::*;
 
 	// TODO: respects priority for unscheduled
@@ -448,10 +433,8 @@ mod tests {
 		task: &mut (impl Future<Output = ()> + Unpin),
 		mut fut: (impl Future<Output = R> + Unpin),
 	) -> R {
-		let cx = Context::from_waker(futures::task::noop_waker_ref());
 		let start = std::time::Instant::now();
-
-		let mut fut = &mut fut;
+		let fut = &mut fut;
 		loop {
 			if start.elapsed() > std::time::Duration::from_secs(1) {
 				// We expect that this will take only a couple of iterations and thus to take way
@@ -636,7 +619,7 @@ mod tests {
 		// to the `soft_capacity` of workers and it doesn't matter which one to cull. Either way,
 		// we just check that edge case of an edge case works.
 		test.send_from_pool(pool::FromPool::Concluded(w1));
-		assert_matches!(test.poll_and_recv_to_pool().await, pool::ToPool::Kill(w1));
+		assert_eq!(test.poll_and_recv_to_pool().await, pool::ToPool::Kill(w1));
 	}
 
 	#[async_std::test]

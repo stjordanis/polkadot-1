@@ -17,8 +17,10 @@
 //! Interface to the Substrate Executor
 
 use std::any::{TypeId, Any};
-use sc_executor::with_externalities_safe;
-use sc_executor_common::{runtime_blob::RuntimeBlob, wasm_runtime::{InvokeMethod, WasmModule as _, WasmInstance as _}};
+use sc_executor_common::{
+	runtime_blob::RuntimeBlob,
+	wasm_runtime::{InvokeMethod, WasmModule as _},
+};
 use sc_executor_wasmtime::{Config, Semantics};
 use sp_core::{
 	storage::{ChildInfo, TrackedStorageKey},
@@ -37,7 +39,7 @@ const CONFIG: Config = Config {
 };
 
 pub fn prevalidate(code: &[u8]) -> Result<RuntimeBlob, sc_executor_common::error::WasmError> {
-	let mut blob = RuntimeBlob::new(code)?;
+	let blob = RuntimeBlob::new(code)?;
 	// TODO: prevalidation
 	Ok(blob)
 }
@@ -50,7 +52,7 @@ pub fn execute(
 	compiled_artifact: &[u8],
 	params: &[u8],
 ) -> Result<Vec<u8>, sc_executor_common::error::Error> {
-	let mut extensions = sp_externalities::Extensions::new();
+	let extensions = sp_externalities::Extensions::new();
 
 	// extensions.register(sp_core::traits::TaskExecutorExt::new(spawner));
 	// extensions.register(sp_core::traits::CallInWasmExt::new(executor.clone()));

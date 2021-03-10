@@ -16,15 +16,14 @@
 
 //! A queue that handles requests for PVF execution.
 
-use crate::worker_common::{IdleWorker, SpawnErr, WorkerHandle};
-
-use super::worker::{self as execute_worker, Outcome};
+use super::worker::Outcome;
+use crate::worker_common::{IdleWorker, WorkerHandle};
 use std::{collections::VecDeque, fmt, task::Poll};
 use futures::{
-	Future, FutureExt, SinkExt as _,
+	Future, FutureExt,
 	channel::{mpsc, oneshot},
 	future::BoxFuture,
-	stream::{FuturesOrdered, FuturesUnordered, StreamExt as _},
+	stream::{FuturesUnordered, StreamExt as _},
 };
 use async_std::path::PathBuf;
 use polkadot_parachain::{

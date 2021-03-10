@@ -15,21 +15,19 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 use crate::{
-	Priority,
-	worker_common::{IdleWorker, WorkerHandle, SpawnErr},
+	worker_common::{IdleWorker, WorkerHandle},
 };
 use super::{
 	worker::{self, Outcome},
 };
 use std::{
-	fmt, mem,
-	pin::Pin,
+	fmt,
 	sync::Arc,
-	task::{Context, Poll},
+	task::Poll,
 };
 use async_std::path::{Path, PathBuf};
 use futures::{
-	Future, FutureExt, SinkExt, StreamExt, channel::mpsc, future::BoxFuture,
+	Future, FutureExt, StreamExt, channel::mpsc, future::BoxFuture,
 	stream::FuturesUnordered,
 };
 use slotmap::HopSlotMap;
@@ -180,6 +178,7 @@ fn handle_to_pool(
 						match worker::spawn(&program_path).await {
 							Ok((idle, handle)) => break PoolEvent::Spawn(idle, handle),
 							Err(err) => {
+								drop(err);
 								// TODO: Retry
 								// TODO: log
 							}
@@ -213,7 +212,7 @@ fn handle_to_pool(
 			}
 		}
 		ToPool::Kill(worker) => {
-			if let Some(mut data) = spawned.remove(worker) {
+			if let Some(data) = spawned.remove(worker) {
 				drop(data);
 			} else {
 				// TODO: Log
