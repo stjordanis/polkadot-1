@@ -89,6 +89,18 @@ pub enum ArtifactState {
 	Preparing,
 }
 
+impl ArtifactState {
+	pub fn into_prepared(self) -> Option<(SystemTime, PathBuf)> {
+		match self {
+			ArtifactState::Prepared {
+				last_time_needed,
+				artifact_path,
+			} => Some((last_time_needed, artifact_path)),
+			ArtifactState::Preparing => None,
+		}
+	}
+}
+
 pub struct Artifacts {
 	// TODO: remove pub
 	pub artifacts: HashMap<ArtifactId, ArtifactState>,
@@ -104,15 +116,13 @@ impl Artifacts {
 			}
 		};
 
-		Self {
-			artifacts,
-		}
+		Self { artifacts }
 	}
 
 	#[cfg(test)]
 	pub(crate) fn empty() -> Self {
 		Self {
-			artifacts: HashMap::new()
+			artifacts: HashMap::new(),
 		}
 	}
 }

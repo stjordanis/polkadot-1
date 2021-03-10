@@ -114,10 +114,18 @@ pub fn start(program_path: &Path, cache_path: &Path) -> (ValidationHost, impl Fu
 
 	let (to_execute_queue_tx, run_execute_queue) = execute::start(program_path.to_owned());
 
+	let (to_sweeper_tx, to_sweeper_rx) = mpsc::channel(100);
+	let run_sweeper = sweeper_task(to_sweeper_rx);
+
 	let run = async move {
 		let artifacts = Artifacts::new(&cache_path).await;
 
-		futures::pin_mut!(run_prepare_queue, run_prepare_pool, run_execute_queue);
+		futures::pin_mut!(
+			run_prepare_queue,
+			run_prepare_pool,
+			run_execute_queue,
+			run_sweeper
+		);
 
 		run(
 			Inner {
@@ -127,11 +135,13 @@ pub fn start(program_path: &Path, cache_path: &Path) -> (ValidationHost, impl Fu
 				to_prepare_queue_tx,
 				from_prepare_queue_rx,
 				to_execute_queue_tx,
+				to_sweeper_tx,
 				awaiting_prepare: HashMap::new(),
 			},
 			run_prepare_pool,
 			run_prepare_queue,
 			run_execute_queue,
+			run_sweeper,
 		)
 		.await
 	};
@@ -154,6 +164,7 @@ struct Inner {
 	from_prepare_queue_rx: mpsc::UnboundedReceiver<prepare::FromQueue>,
 
 	to_execute_queue_tx: mpsc::Sender<execute::ToQueue>,
+	to_sweeper_tx: mpsc::Sender<PathBuf>,
 
 	awaiting_prepare: HashMap<ArtifactId, Vec<PendingExecutionRequest>>,
 }
@@ -169,11 +180,13 @@ async fn run(
 		from_prepare_queue_rx,
 		mut to_prepare_queue_tx,
 		mut to_execute_queue_tx,
+		mut to_sweeper_tx,
 		mut awaiting_prepare,
 	}: Inner,
 	prepare_pool: impl Future<Output = ()> + Unpin,
 	prepare_queue: impl Future<Output = ()> + Unpin,
 	execute_queue: impl Future<Output = ()> + Unpin,
+	sweeper: impl Future<Output = ()> + Unpin,
 ) {
 	macro_rules! break_if_fatal {
 		($expr:expr) => {
@@ -184,23 +197,38 @@ async fn run(
 		};
 	}
 
+	let cleanup_pulse = pulse_every(std::time::Duration::from_secs(5)).fuse();
+	futures::pin_mut!(cleanup_pulse);
+
 	let mut from_handle_rx = from_handle_rx.fuse();
 	let mut from_prepare_queue_rx = from_prepare_queue_rx.fuse();
+
+	// Make sure that the task-futures are fused.
 	let mut prepare_queue = prepare_queue.fuse();
 	let mut prepare_pool = prepare_pool.fuse();
 	let mut execute_queue = execute_queue.fuse();
+	let mut sweeper = sweeper.fuse();
 
 	loop {
 		futures::select! {
 			_ = prepare_queue => {
 				panic!()
-			}
+			},
 			_ = prepare_pool => {
 				panic!()
-			}
+			},
 			_ = execute_queue => {
 				panic!()
-			}
+			},
+			_ = sweeper => {
+				panic!()
+			},
+			() = cleanup_pulse.select_next_some() => {
+				break_if_fatal!(handle_cleanup_pulse(
+					&mut to_sweeper_tx,
+					&mut artifacts,
+				).await);
+			},
 			from_handle = from_handle_rx.next() => {
 				let from_handle = break_if_fatal!(from_handle.ok_or(Fatal));
 
@@ -327,10 +355,21 @@ async fn handle_heads_up(
 	prepare_queue: &mut mpsc::Sender<prepare::ToQueue>,
 	active_pvfs: Vec<Pvf>,
 ) -> Result<(), Fatal> {
+	let now = SystemTime::now();
+
 	for active_pvf in active_pvfs {
 		let artifact_id = active_pvf.to_artifact_id();
 		match artifacts.artifacts.entry(artifact_id.clone()) {
-			Entry::Occupied(_) => {}
+			Entry::Occupied(mut o) => {
+				match o.get_mut() {
+				    ArtifactState::Prepared { last_time_needed, .. } => {
+						*last_time_needed = now.clone();
+					}
+				    ArtifactState::Preparing => {
+						// Already preparing so no need to update the last needed.
+					}
+				}
+			}
 			Entry::Vacant(v) => {
 				v.insert(ArtifactState::Preparing);
 
@@ -385,9 +424,82 @@ async fn handle_prepare_done(
 	Ok(())
 }
 
+async fn handle_cleanup_pulse(
+	sweeper_tx: &mut mpsc::Sender<PathBuf>,
+	artifacts: &mut Artifacts,
+) -> Result<(), Fatal> {
+	let now = std::time::SystemTime::now();
+
+	let mut to_remove = vec![];
+	for (k, v) in artifacts.artifacts.iter() {
+		if let ArtifactState::Prepared {
+			last_time_needed, ..
+		} = *v
+		{
+			if now
+				.duration_since(last_time_needed)
+				.map(|age| age > std::time::Duration::from_secs(10))
+				.unwrap_or(false)
+			{
+				to_remove.push(k.clone());
+			}
+		}
+	}
+
+	for k in to_remove {
+		let (_, artifact_path) = artifacts
+			.artifacts
+			.remove(&k)
+			.expect("k is from to_remove; to_remove is based on the actual kv pairs; qed")
+			.into_prepared()
+			.expect("k is from to_remove; to_remove consists of prepared artifacts; qed");
+
+		sweeper_tx.send(artifact_path).await.map_err(|_| Fatal)?;
+	}
+
+	Ok(())
+}
+
+/// A simple task which sole purpose is to delete files thrown at it.
+async fn sweeper_task(mut sweeper_rx: mpsc::Receiver<PathBuf>) {
+	loop {
+		match sweeper_rx.next().await {
+			None => break,
+			Some(condemned) => {
+				let _ = async_std::fs::remove_file(condemned).await;
+			}
+		}
+	}
+}
+
+/// A stream that yields a pulse continuously at a given interval.
+fn pulse_every(interval: std::time::Duration) -> impl futures::Stream<Item = ()> {
+	futures::stream::unfold(interval, {
+		|interval| async move {
+			futures_timer::Delay::new(interval).await;
+			Some(((), interval))
+		}
+	})
+	.map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[async_std::test]
+	async fn pulse_test() {
+		let pulse = pulse_every(std::time::Duration::from_millis(100));
+		futures::pin_mut!(pulse);
+
+		for _ in 0usize..5usize {
+			let start = std::time::Instant::now();
+			let _ = pulse.next().await.unwrap();
+
+			let el = start.elapsed().as_millis();
+			assert!(el > 50 && el < 150, "{}", el);
+		}
+	}
 
 	#[async_std::test]
 	async fn shutdown_on_handle_drop() {
@@ -398,15 +510,9 @@ mod tests {
 		let (to_prepare_queue_tx, _to_prepare_queue_rx) = mpsc::channel(10);
 		let (_from_prepare_queue_tx, from_prepare_queue_rx) = mpsc::unbounded();
 		let (to_execute_queue_tx, _to_execute_queue_rx) = mpsc::channel(10);
+		let (to_sweeper_tx, _to_sweeper_rx) = mpsc::channel(10);
 
-		let mk_dummy_loop = || {
-			async {
-				loop {
-					futures::pending!()
-				}
-			}
-			.boxed()
-		};
+		let mk_dummy_loop = || std::future::pending().boxed();
 
 		let join_handle = async_std::task::spawn(run(
 			Inner {
@@ -416,8 +522,10 @@ mod tests {
 				to_prepare_queue_tx,
 				from_prepare_queue_rx,
 				to_execute_queue_tx,
+				to_sweeper_tx,
 				awaiting_prepare: HashMap::new(),
 			},
+			mk_dummy_loop(),
 			mk_dummy_loop(),
 			mk_dummy_loop(),
 			mk_dummy_loop(),
@@ -428,4 +536,6 @@ mod tests {
 		drop(from_handle_tx);
 		join_handle.await;
 	}
+
+	// TODO: heads up should reset the timer
 }
