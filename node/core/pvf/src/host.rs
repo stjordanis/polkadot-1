@@ -153,6 +153,7 @@ struct Inner {
 	awaiting_prepare: HashMap<ArtifactId, Vec<PendingExecutionRequest>>,
 }
 
+#[derive(Debug)]
 struct Fatal;
 
 async fn run(
@@ -171,8 +172,9 @@ async fn run(
 ) {
 	macro_rules! break_if_fatal {
 		($expr:expr) => {
-			if let Err(Fatal) = $expr {
-				break;
+			match $expr {
+				Err(Fatal) => break,
+				Ok(v) => v,
 				}
 		};
 	}
@@ -194,7 +196,9 @@ async fn run(
 			_ = execute_queue => {
 				panic!()
 			}
-			from_handle = from_handle_rx.select_next_some() => {
+			from_handle = from_handle_rx.next() => {
+				let from_handle = break_if_fatal!(from_handle.ok_or(Fatal));
+
 				break_if_fatal!(handle_from_handle(
 					&mut artifacts,
 					&mut to_prepare_queue_tx,
@@ -204,7 +208,10 @@ async fn run(
 				)
 				.await);
 			},
-			prepare::FromQueue::Prepared(artifact_id) = from_prepare_queue_rx.select_next_some() => {
+			from_prepare_queue = from_prepare_queue_rx.next() => {
+				let prepare::FromQueue::Prepared(artifact_id)
+					= break_if_fatal!(from_prepare_queue.ok_or(Fatal));
+
 				// Note that preparation always succeeds.
 				//
 				// That's because the error conditions are written into the artifact and will be
@@ -376,4 +383,48 @@ async fn handle_prepare_done(
 struct PendingExecutionRequest {
 	params: Vec<u8>,
 	result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[async_std::test]
+	async fn shutdown_on_handle_drop() {
+		let artifacts = Artifacts::empty();
+		let cache_path = PathBuf::from(std::env::temp_dir());
+
+		let (from_handle_tx, from_handle_rx) = mpsc::channel(10);
+		let (to_prepare_queue_tx, _to_prepare_queue_rx) = mpsc::channel(10);
+		let (_from_prepare_queue_tx, from_prepare_queue_rx) = mpsc::unbounded();
+		let (to_execute_queue_tx, _to_execute_queue_rx) = mpsc::channel(10);
+
+		let mk_dummy_loop = || {
+			async {
+				loop {
+					futures::pending!()
+				}
+			}
+			.boxed()
+		};
+
+		let join_handle = async_std::task::spawn(run(
+			Inner {
+				cache_path,
+				artifacts,
+				from_handle_rx,
+				to_prepare_queue_tx,
+				from_prepare_queue_rx,
+				to_execute_queue_tx,
+				awaiting_prepare: HashMap::new(),
+			},
+			mk_dummy_loop(),
+			mk_dummy_loop(),
+			mk_dummy_loop(),
+		));
+
+		drop(from_handle_tx);
+
+		join_handle.await;
+	}
 }

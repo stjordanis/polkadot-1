@@ -108,6 +108,13 @@ impl Artifacts {
 			artifacts,
 		}
 	}
+
+	#[cfg(test)]
+	pub(crate) fn empty() -> Self {
+		Self {
+			artifacts: HashMap::new()
+		}
+	}
 }
 
 async fn scan_for_known_artifacts(
