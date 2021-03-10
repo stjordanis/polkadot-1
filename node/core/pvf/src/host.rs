@@ -139,6 +139,11 @@ pub fn start(program_path: &Path, cache_path: &Path) -> (ValidationHost, impl Fu
 	(validation_host, run)
 }
 
+struct PendingExecutionRequest {
+	params: Vec<u8>,
+	result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
+}
+
 struct Inner {
 	cache_path: PathBuf,
 	artifacts: Artifacts,
@@ -380,11 +385,6 @@ async fn handle_prepare_done(
 	Ok(())
 }
 
-struct PendingExecutionRequest {
-	params: Vec<u8>,
-	result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -423,8 +423,9 @@ mod tests {
 			mk_dummy_loop(),
 		));
 
+		// Dropping the handle will lead to conclusion of the read part and thus will make the event
+		// loop to stop, which in turn will resolve the join handle.
 		drop(from_handle_tx);
-
 		join_handle.await;
 	}
 }
