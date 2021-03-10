@@ -21,7 +21,7 @@ use crate::{
 };
 use std::{
 	collections::{HashMap, hash_map::Entry},
-	time::SystemTime,
+	time::{Duration, SystemTime},
 };
 use async_std::{
 	path::{Path, PathBuf},
@@ -130,6 +130,8 @@ pub fn start(program_path: &Path, cache_path: &Path) -> (ValidationHost, impl Fu
 		run(
 			Inner {
 				cache_path,
+				cleanup_pulse_interval: Duration::from_secs(3600),
+				artifact_ttl: Duration::from_secs(3600 * 24),
 				artifacts,
 				from_handle_rx,
 				to_prepare_queue_tx,
@@ -156,6 +158,8 @@ struct PendingExecutionRequest {
 
 struct Inner {
 	cache_path: PathBuf,
+	cleanup_pulse_interval: Duration,
+	artifact_ttl: Duration,
 	artifacts: Artifacts,
 
 	from_handle_rx: mpsc::Receiver<FromHandle>,
@@ -175,6 +179,8 @@ struct Fatal;
 async fn run(
 	Inner {
 		cache_path,
+		cleanup_pulse_interval,
+		artifact_ttl,
 		mut artifacts,
 		from_handle_rx,
 		from_prepare_queue_rx,
@@ -197,7 +203,7 @@ async fn run(
 		};
 	}
 
-	let cleanup_pulse = pulse_every(std::time::Duration::from_secs(5)).fuse();
+	let cleanup_pulse = pulse_every(cleanup_pulse_interval).fuse();
 	futures::pin_mut!(cleanup_pulse);
 
 	let mut from_handle_rx = from_handle_rx.fuse();
@@ -210,7 +216,7 @@ async fn run(
 	let mut sweeper = sweeper.fuse();
 
 	loop {
-		futures::select! {
+		futures::select_biased! {
 			_ = prepare_queue => {
 				panic!()
 			},
@@ -227,6 +233,7 @@ async fn run(
 				break_if_fatal!(handle_cleanup_pulse(
 					&mut to_sweeper_tx,
 					&mut artifacts,
+					&artifact_ttl,
 				).await);
 			},
 			from_handle = from_handle_rx.next() => {
@@ -362,10 +369,12 @@ async fn handle_heads_up(
 		match artifacts.artifacts.entry(artifact_id.clone()) {
 			Entry::Occupied(mut o) => {
 				match o.get_mut() {
-				    ArtifactState::Prepared { last_time_needed, .. } => {
+					ArtifactState::Prepared {
+						last_time_needed, ..
+					} => {
 						*last_time_needed = now.clone();
 					}
-				    ArtifactState::Preparing => {
+					ArtifactState::Preparing => {
 						// Already preparing so no need to update the last needed.
 					}
 				}
@@ -427,6 +436,7 @@ async fn handle_prepare_done(
 async fn handle_cleanup_pulse(
 	sweeper_tx: &mut mpsc::Sender<PathBuf>,
 	artifacts: &mut Artifacts,
+	artifact_ttl: &Duration,
 ) -> Result<(), Fatal> {
 	let now = std::time::SystemTime::now();
 
@@ -438,10 +448,10 @@ async fn handle_cleanup_pulse(
 		{
 			if now
 				.duration_since(last_time_needed)
-				.map(|age| age > std::time::Duration::from_secs(10))
+				.map(|age| age > *artifact_ttl)
 				.unwrap_or(false)
 			{
-				to_remove.push(k.clone());
+				to_remove.push(dbg!(k.clone()));
 			}
 		}
 	}
@@ -485,11 +495,14 @@ fn pulse_every(interval: std::time::Duration) -> impl futures::Stream<Item = ()>
 
 #[cfg(test)]
 mod tests {
+	use std::ops::Sub;
+
+    use futures::future::BoxFuture;
 	use super::*;
 
 	#[async_std::test]
 	async fn pulse_test() {
-		let pulse = pulse_every(std::time::Duration::from_millis(100));
+		let pulse = pulse_every(Duration::from_millis(100));
 		futures::pin_mut!(pulse);
 
 		for _ in 0usize..5usize {
@@ -501,41 +514,180 @@ mod tests {
 		}
 	}
 
+	/// Creates a new pvf which artifact id can be uniquely identified by the given number.
+	fn artifact_id(descriminator: u32) -> ArtifactId {
+		Pvf::from_discriminator(descriminator).to_artifact_id()
+	}
+
+	fn artifact_path(descriminator: u32) -> PathBuf {
+		artifact_id(descriminator)
+			.path(&PathBuf::from(std::env::temp_dir()))
+			.to_owned()
+	}
+
+	struct Builder {
+		cleanup_pulse_interval: Duration,
+		artifact_ttl: Duration,
+		artifacts: Artifacts,
+	}
+
+	impl Builder {
+		fn default() -> Self {
+			Self {
+				// just to not fire on regular tests.
+				cleanup_pulse_interval: Duration::from_secs(3600),
+				artifact_ttl: Duration::from_secs(3600),
+
+				artifacts: Artifacts::empty(),
+			}
+		}
+
+		fn build(self) -> Test {
+			Test::new(self)
+		}
+	}
+
+	struct Test {
+		from_handle_tx: Option<mpsc::Sender<FromHandle>>,
+
+		to_prepare_queue_rx: mpsc::Receiver<prepare::ToQueue>,
+		from_prepare_queue_tx: mpsc::UnboundedSender<prepare::FromQueue>,
+		to_execute_queue_rx: mpsc::Receiver<execute::ToQueue>,
+		to_sweeper_rx: mpsc::Receiver<PathBuf>,
+
+		run: BoxFuture<'static, ()>,
+	}
+
+	impl Test {
+		fn new(
+			Builder {
+				cleanup_pulse_interval,
+				artifact_ttl,
+				artifacts,
+			}: Builder,
+		) -> Self {
+			let cache_path = PathBuf::from(std::env::temp_dir());
+
+			let (from_handle_tx, from_handle_rx) = mpsc::channel(10);
+			let (to_prepare_queue_tx, to_prepare_queue_rx) = mpsc::channel(10);
+			let (from_prepare_queue_tx, from_prepare_queue_rx) = mpsc::unbounded();
+			let (to_execute_queue_tx, to_execute_queue_rx) = mpsc::channel(10);
+			let (to_sweeper_tx, to_sweeper_rx) = mpsc::channel(10);
+
+			let mk_dummy_loop = || std::future::pending().boxed();
+
+			let run = run(
+				Inner {
+					cache_path,
+					cleanup_pulse_interval,
+					artifact_ttl,
+					artifacts,
+					from_handle_rx,
+					to_prepare_queue_tx,
+					from_prepare_queue_rx,
+					to_execute_queue_tx,
+					to_sweeper_tx,
+					awaiting_prepare: HashMap::new(),
+				},
+				mk_dummy_loop(),
+				mk_dummy_loop(),
+				mk_dummy_loop(),
+				mk_dummy_loop(),
+			)
+			.boxed();
+
+			Self {
+				from_handle_tx: Some(from_handle_tx),
+				to_prepare_queue_rx,
+				from_prepare_queue_tx,
+				to_execute_queue_rx,
+				to_sweeper_rx,
+				run,
+			}
+		}
+
+		fn host_handle(&mut self) -> ValidationHost {
+			let tx = self.from_handle_tx.take().unwrap();
+			ValidationHost {
+				from_handle_tx: Mutex::new(tx),
+			}
+		}
+	}
+
 	#[async_std::test]
 	async fn shutdown_on_handle_drop() {
-		let artifacts = Artifacts::empty();
-		let cache_path = PathBuf::from(std::env::temp_dir());
+		let test = Builder::default().build();
 
-		let (from_handle_tx, from_handle_rx) = mpsc::channel(10);
-		let (to_prepare_queue_tx, _to_prepare_queue_rx) = mpsc::channel(10);
-		let (_from_prepare_queue_tx, from_prepare_queue_rx) = mpsc::unbounded();
-		let (to_execute_queue_tx, _to_execute_queue_rx) = mpsc::channel(10);
-		let (to_sweeper_tx, _to_sweeper_rx) = mpsc::channel(10);
-
-		let mk_dummy_loop = || std::future::pending().boxed();
-
-		let join_handle = async_std::task::spawn(run(
-			Inner {
-				cache_path,
-				artifacts,
-				from_handle_rx,
-				to_prepare_queue_tx,
-				from_prepare_queue_rx,
-				to_execute_queue_tx,
-				to_sweeper_tx,
-				awaiting_prepare: HashMap::new(),
-			},
-			mk_dummy_loop(),
-			mk_dummy_loop(),
-			mk_dummy_loop(),
-			mk_dummy_loop(),
-		));
+		let join_handle = async_std::task::spawn(test.run);
 
 		// Dropping the handle will lead to conclusion of the read part and thus will make the event
 		// loop to stop, which in turn will resolve the join handle.
-		drop(from_handle_tx);
+		drop(test.from_handle_tx);
 		join_handle.await;
 	}
 
-	// TODO: heads up should reset the timer
+	async fn run_until<R>(
+		task: &mut (impl Future<Output = ()> + Unpin),
+		mut fut: (impl Future<Output = R> + Unpin),
+	) -> R {
+		use std::task::Poll;
+
+		let start = std::time::Instant::now();
+		let fut = &mut fut;
+		loop {
+			if start.elapsed() > std::time::Duration::from_secs(2) {
+				// We expect that this will take only a couple of iterations and thus to take way
+				// less than a second.
+				panic!("timeout");
+			}
+
+			if let Poll::Ready(r) = futures::poll!(&mut *fut) {
+				break r;
+			}
+
+			if futures::poll!(&mut *task).is_ready() {
+				panic!()
+			}
+		}
+	}
+
+	#[async_std::test]
+	async fn pruning() {
+		let mock_now = SystemTime::now().sub(Duration::from_millis(1000));
+
+		let mut builder = Builder::default();
+		builder.cleanup_pulse_interval = Duration::from_millis(100);
+		builder.artifact_ttl = Duration::from_millis(500);
+		builder.artifacts.artifacts.insert(
+			artifact_id(1),
+			ArtifactState::Prepared {
+				last_time_needed: mock_now,
+				artifact_path: artifact_path(1),
+			},
+		);
+		builder.artifacts.artifacts.insert(
+			artifact_id(2),
+			ArtifactState::Prepared {
+				last_time_needed: mock_now,
+				artifact_path: artifact_path(2),
+			},
+		);
+		let mut test = builder.build();
+		let mut host = test.host_handle();
+
+		host.heads_up(vec![Pvf::from_discriminator(1)])
+			.now_or_never()
+			.unwrap()
+			.unwrap();
+
+		let to_sweeper_rx = &mut test.to_sweeper_rx;
+		run_until(
+			&mut test.run,
+			async {
+				assert_eq!(to_sweeper_rx.next().await.unwrap(), artifact_path(2));
+			}
+			.boxed(),
+		)
+		.await;
+	}
 }

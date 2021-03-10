@@ -425,8 +425,7 @@ mod tests {
 
 	/// Creates a new pvf which artifact id can be uniquely identified by the given number.
 	fn pvf(descriminator: u32) -> Pvf {
-		let d_buf = descriminator.to_le_bytes();
-		Pvf::from_code(&d_buf)
+		Pvf::from_discriminator(descriminator)
 	}
 
 	async fn run_until<R>(
