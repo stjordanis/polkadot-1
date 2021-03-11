@@ -20,18 +20,14 @@ use crate::{
 use super::{
 	worker::{self, Outcome},
 };
-use std::{
-	fmt,
-	sync::Arc,
-	task::Poll,
-};
+use std::{fmt, sync::Arc, task::Poll};
 use async_std::path::{Path, PathBuf};
 use futures::{
-	Future, FutureExt, StreamExt, channel::mpsc, future::BoxFuture,
-	stream::FuturesUnordered,
+	Future, FutureExt, StreamExt, channel::mpsc, future::BoxFuture, stream::FuturesUnordered,
 };
 use slotmap::HopSlotMap;
 use assert_matches::assert_matches;
+use always_assert::{never, always};
 
 slotmap::new_key_type! { pub struct Worker; }
 
@@ -195,34 +191,32 @@ fn handle_to_pool(
 			background_priority,
 		} => {
 			if let Some(data) = spawned.get_mut(worker) {
-				let idle = data.idle.take().unwrap(); // TODO: this shouldn't be none
-
-				mux.push(
-					async move {
-						PoolEvent::StartWork(
-							worker,
-							worker::start_work(idle, code, artifact_path, background_priority)
-								.await,
-						)
-					}
-					.boxed(),
-				);
+				if let Some(idle) = data.idle.take() {
+					mux.push(
+						async move {
+							PoolEvent::StartWork(
+								worker,
+								worker::start_work(idle, code, artifact_path, background_priority)
+									.await,
+							)
+						}
+						.boxed(),
+					);
+				} else {
+					never!();
+				}
 			} else {
-				// TODO: Log
+				never!();
 			}
 		}
 		ToPool::Kill(worker) => {
-			if let Some(data) = spawned.remove(worker) {
-				drop(data);
-			} else {
-				// TODO: Log
-			}
+			always!(spawned.remove(worker).is_some());
 		}
 		ToPool::BumpPriority(worker) => {
 			if let Some(data) = spawned.get(worker) {
 				worker::bump_priority(&data.handle);
 			} else {
-				// TODO: Log
+				never!()
 			}
 		}
 	}

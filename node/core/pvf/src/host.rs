@@ -102,7 +102,7 @@ pub fn start(program_path: &Path, cache_path: &Path) -> (ValidationHost, impl Fu
 		from_prepare_pool,
 	);
 
-	let (to_execute_queue_tx, run_execute_queue) = execute::start(program_path.to_owned());
+	let (to_execute_queue_tx, run_execute_queue) = execute::start(program_path.to_owned(), 5);
 
 	let (to_sweeper_tx, to_sweeper_rx) = mpsc::channel(100);
 	let run_sweeper = sweeper_task(to_sweeper_rx);

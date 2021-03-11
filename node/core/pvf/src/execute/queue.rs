@@ -63,22 +63,20 @@ impl fmt::Debug for WorkerData {
 struct Workers {
 	running: HopSlotMap<Worker, WorkerData>,
 
-	/// The number of workers either live or just spawned.
-	spawned_num: usize,
+	spawn_inflight: usize,
 
 	capacity: usize,
 }
 
 impl Workers {
 	fn can_afford_one_more(&self) -> bool {
-		self.spawned_num < self.capacity
+		self.spawn_inflight + self.running.len() < self.capacity
 	}
 
 	fn find_available(&self) -> Option<Worker> {
 		self.running
 			.iter()
-			.filter_map(|d| if d.1.idle.is_some() { Some(d.0) } else { None })
-			.next()
+			.find_map(|d| if d.1.idle.is_some() { Some(d.0) } else { None })
 	}
 
 	fn claim_idle(&mut self, worker: Worker) -> IdleWorker {
@@ -116,7 +114,11 @@ struct Queue {
 }
 
 impl Queue {
-	fn new(program_path: PathBuf, to_queue_rx: mpsc::Receiver<ToQueue>) -> Self {
+	fn new(
+		program_path: PathBuf,
+		worker_capacity: usize,
+		to_queue_rx: mpsc::Receiver<ToQueue>,
+	) -> Self {
 		Self {
 			program_path,
 			to_queue_rx,
@@ -124,8 +126,8 @@ impl Queue {
 			mux: Mux::new(),
 			workers: Workers {
 				running: HopSlotMap::with_capacity_and_key(10),
-				spawned_num: 0,
-				capacity: 10,
+				spawn_inflight: 0,
+				capacity: worker_capacity,
 			},
 		}
 	}
@@ -153,7 +155,6 @@ async fn purge_dead(workers: &mut Workers) {
 	}
 	for w in to_remove {
 		let _ = workers.running.remove(w);
-		workers.spawned_num -= 1;
 	}
 }
 
@@ -183,6 +184,8 @@ fn handle_to_queue(queue: &mut Queue, to_queue: ToQueue) {
 async fn handle_mux(queue: &mut Queue, event: QueueEvent) {
 	match event {
 		QueueEvent::Spawn((idle, handle)) => {
+			queue.workers.spawn_inflight -= 1;
+
 			let worker = queue.workers.running.insert(WorkerData {
 				idle: Some(idle),
 				handle,
@@ -279,7 +282,7 @@ fn spawn_extra_worker(queue: &mut Queue) {
 		.boxed(),
 	);
 
-	queue.workers.spawned_num += 1;
+	queue.workers.spawn_inflight += 1;
 }
 
 fn assign(queue: &mut Queue, worker: Worker, job: ExecuteJob) {
@@ -293,8 +296,11 @@ fn assign(queue: &mut Queue, worker: Worker, job: ExecuteJob) {
 	);
 }
 
-pub fn start(program_path: PathBuf) -> (mpsc::Sender<ToQueue>, impl Future<Output = ()>) {
+pub fn start(
+	program_path: PathBuf,
+	worker_capacity: usize,
+) -> (mpsc::Sender<ToQueue>, impl Future<Output = ()>) {
 	let (to_queue_tx, to_queue_rx) = mpsc::channel(20);
-	let run = Queue::new(program_path, to_queue_rx).run();
+	let run = Queue::new(program_path, worker_capacity, to_queue_rx).run();
 	(to_queue_tx, run)
 }
