@@ -21,9 +21,18 @@ use crate::{Priority, Pvf, artifacts::ArtifactId};
 use futures::{Future, SinkExt, channel::mpsc, stream::StreamExt as _};
 use std::collections::{HashMap, VecDeque};
 use async_std::path::PathBuf;
+use always_assert::never;
 
+#[derive(Debug)]
 pub enum ToQueue {
-	Enqueue { priority: Priority, pvf: Pvf },
+	Enqueue {
+		priority: Priority,
+		pvf: Pvf,
+	},
+	Amend {
+		priority: Priority,
+		artifact_id: ArtifactId,
+	},
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -181,8 +190,8 @@ impl Queue {
 		loop {
 			// biased to make it behave deterministically for tests.
 			futures::select_biased! {
-				ToQueue::Enqueue { pvf, priority } = self.to_queue_rx.select_next_some() =>
-					break_if_fatal!(enqueue(&mut self, priority, pvf).await),
+				to_queue = self.to_queue_rx.select_next_some() =>
+					break_if_fatal!(handle_to_queue(&mut self, to_queue).await),
 				from_pool = self.from_pool_rx.select_next_some() =>
 					break_if_fatal!(handle_from_pool(&mut self, from_pool).await),
 			}
@@ -190,32 +199,28 @@ impl Queue {
 	}
 }
 
-async fn enqueue(queue: &mut Queue, priority: Priority, pvf: Pvf) -> Result<(), Fatal> {
+async fn handle_to_queue(queue: &mut Queue, to_queue: ToQueue) -> Result<(), Fatal> {
+	match to_queue {
+		ToQueue::Enqueue { priority, pvf } => {
+			handle_enqueue(queue, priority, pvf).await?;
+		}
+		ToQueue::Amend {
+			priority,
+			artifact_id,
+		} => {
+			handle_amend(queue, priority, artifact_id).await?;
+		}
+	}
+	Ok(())
+}
+
+async fn handle_enqueue(queue: &mut Queue, priority: Priority, pvf: Pvf) -> Result<(), Fatal> {
 	println!("enque");
 
 	let artifact_id = pvf.to_artifact_id();
-	if let Some(&job) = queue.artifact_id_to_job.get(&artifact_id) {
-		println!("artifact is known");
-		// The artifact id is already known to the queue.
-		let mut job_data: &mut JobData = &mut queue.jobs[job];
-
-		if job_data.priority < priority {
-			// The new priority is higher. We should do two things:
-			// - if the worker was already spawned with the background prio and the new one is not
-			//   (it's already the case, if we are in this branch but we still do the check for
-			//   clarity), then we should tell the pool to bump the priority for the worker.
-			//
-			// - save the new priority in the job.
-
-			if let Some(worker) = job_data.worker {
-				if job_data.priority.is_background() && !priority.is_background() {
-					send_pool(&mut queue.to_pool_tx, pool::ToPool::BumpPriority(worker)).await?;
-				}
-			}
-
-			job_data.priority = dbg!(priority);
-		}
-
+	if never!(queue.artifact_id_to_job.contains_key(&artifact_id)) {
+		// We already know about this artifact yet it was still enqueued.
+		// TODO: log
 		return Ok(());
 	}
 
@@ -246,6 +251,35 @@ fn find_idle_worker(queue: &mut Queue) -> Option<Worker> {
 		.next()
 }
 
+async fn handle_amend(
+	queue: &mut Queue,
+	priority: Priority,
+	artifact_id: ArtifactId,
+) -> Result<(), Fatal> {
+	if let Some(&job) = queue.artifact_id_to_job.get(&artifact_id) {
+		let mut job_data: &mut JobData = &mut queue.jobs[job];
+
+		if job_data.priority < priority {
+			// The new priority is higher. We should do two things:
+			// - if the worker was already spawned with the background prio and the new one is not
+			//   (it's already the case, if we are in this branch but we still do the check for
+			//   clarity), then we should tell the pool to bump the priority for the worker.
+			//
+			// - save the new priority in the job.
+
+			if let Some(worker) = job_data.worker {
+				if job_data.priority.is_background() && !priority.is_background() {
+					send_pool(&mut queue.to_pool_tx, pool::ToPool::BumpPriority(worker)).await?;
+				}
+			}
+
+			job_data.priority = dbg!(priority);
+		}
+	}
+
+	Ok(())
+}
+
 async fn handle_from_pool(queue: &mut Queue, from_pool: pool::FromPool) -> Result<(), Fatal> {
 	use pool::FromPool::*;
 	match from_pool {
@@ -269,24 +303,24 @@ async fn handle_worker_spawned(queue: &mut Queue, worker: Worker) -> Result<(), 
 }
 
 async fn handle_worker_concluded(queue: &mut Queue, worker: Worker) -> Result<(), Fatal> {
-	let job = match queue.workers.get_mut(worker) {
-		None => {
-			// TODO: a worker concluded which doesn't belong to this queue
-			return Ok(());
-		}
-		Some(worker_data) => {
-			match worker_data.job.take() {
+	macro_rules! never_none {
+		($expr:expr) => {
+			match $expr {
+				Some(v) => v,
 				None => {
-					// TODO: a worker that didn't have job concluded
+					never!();
 					return Ok(());
 				}
-				Some(job) => job,
 			}
-		}
-	};
+		};
+	}
 
-	let job_data = queue.jobs.remove(job).unwrap(); // TODO: this should be always some
+	// Extract the 
+	let worker_data = never_none!(queue.workers.get_mut(worker));
+	let job = never_none!(worker_data.job.take());
+	let job_data = never_none!(queue.jobs.remove(job));
 	let artifact_id = job_data.pvf.to_artifact_id();
+
 	queue.artifact_id_to_job.remove(&artifact_id);
 
 	reply(&mut queue.from_queue_tx, FromQueue::Prepared(artifact_id))?;
@@ -636,9 +670,9 @@ mod tests {
 		test.send_from_pool(pool::FromPool::Spawned(w));
 
 		assert_matches!(test.poll_and_recv_to_pool().await, pool::ToPool::StartWork { .. });
-		test.send_queue(ToQueue::Enqueue {
+		test.send_queue(ToQueue::Amend {
 			priority: Priority::Normal,
-			pvf: pvf(1),
+			artifact_id: pvf(1).to_artifact_id(),
 		});
 
 		assert_eq!(

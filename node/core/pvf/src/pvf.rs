@@ -17,7 +17,7 @@
 use crate::artifacts::ArtifactId;
 use polkadot_core_primitives::Hash;
 use sp_core::keccak_256;
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 /// A struct that carries code of a parachain validation function and it's hash.
 ///
@@ -26,6 +26,12 @@ use std::sync::Arc;
 pub struct Pvf {
 	pub(crate) code: Arc<Vec<u8>>,
 	pub(crate) code_hash: Hash,
+}
+
+impl fmt::Debug for Pvf {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "Pvf {{ code, code_hash: {:?} }}", self.code_hash)
+	}
 }
 
 impl Pvf {
@@ -44,6 +50,7 @@ impl Pvf {
 
 	/// Returns the artifact ID that corresponds to this PVF.
 	pub fn to_artifact_id(&self) -> ArtifactId {
+		// TODO: rename this to `as` since it doesn't perform any costly conversion?
 		ArtifactId::new(self.code_hash.clone())
 	}
 }

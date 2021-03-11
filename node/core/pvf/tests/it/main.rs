@@ -49,13 +49,17 @@ impl TestHost {
 		code: &[u8],
 		params: ValidationParams,
 	) -> Result<ValidationResult, ValidationError> {
+		let (result_tx, result_rx) = futures::channel::oneshot::channel();
 		self.host
 			.execute_pvf(
 				Pvf::from_code(code),
 				params.encode(),
 				polkadot_node_core_pvf::Priority::Normal,
+				result_tx,
 			)
 			.await
+			.unwrap();
+		result_rx.await.unwrap()
 	}
 }
 

@@ -34,6 +34,7 @@ use slotmap::HopSlotMap;
 
 slotmap::new_key_type! { struct Worker; }
 
+#[derive(Debug)]
 pub enum ToQueue {
 	Enqueue {
 		artifact_path: PathBuf,

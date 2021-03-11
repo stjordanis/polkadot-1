@@ -27,10 +27,7 @@ use async_std::{
 	path::{Path, PathBuf},
 	sync::Mutex,
 };
-use polkadot_parachain::{
-	primitives::ValidationResult,
-	wasm_executor::{InternalError, ValidationError},
-};
+use polkadot_parachain::{primitives::ValidationResult, wasm_executor::ValidationError};
 use futures::{
 	Future, FutureExt, SinkExt, StreamExt,
 	channel::{mpsc, oneshot},
@@ -46,10 +43,8 @@ impl ValidationHost {
 		pvf: Pvf,
 		params: Vec<u8>,
 		priority: Priority,
-	) -> Result<ValidationResult, ValidationError> {
-		let (result_tx, result_rx) =
-			oneshot::channel::<Result<ValidationResult, ValidationError>>();
-
+		result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
+	) -> Result<(), String> {
 		self.from_handle_tx
 			.lock()
 			.await
@@ -60,15 +55,10 @@ impl ValidationHost {
 				result_tx,
 			})
 			.await
-			.map_err(|_| {
-				ValidationError::Internal(InternalError::System("the inner loop hung up".into()))
-			})?;
-		result_rx.await.map_err(|_| {
-			ValidationError::Internal(InternalError::System("execute_pvf was interrupted".into()))
-		})?
+			.map_err(|_| format!("the inner loop hung up"))
 	}
 
-	pub async fn heads_up(&mut self, active_pvfs: Vec<Pvf>) -> Result<(), String> {
+	pub async fn heads_up(&self, active_pvfs: Vec<Pvf>) -> Result<(), String> {
 		self.from_handle_tx
 			.lock()
 			.await
@@ -151,6 +141,7 @@ pub fn start(program_path: &Path, cache_path: &Path) -> (ValidationHost, impl Fu
 	(validation_host, run)
 }
 
+#[derive(Debug)]
 struct PendingExecutionRequest {
 	params: Vec<u8>,
 	result_tx: oneshot::Sender<Result<ValidationResult, ValidationError>>,
@@ -324,6 +315,7 @@ async fn handle_execute_pvf(
 			ArtifactState::Prepared {
 				ref artifact_path, ..
 			} => {
+				// TODO: Update the last needed
 				execute_queue
 					.send(execute::ToQueue::Enqueue {
 						artifact_path: artifact_path.clone(),
@@ -334,6 +326,14 @@ async fn handle_execute_pvf(
 					.map_err(|_| Fatal)?;
 			}
 			ArtifactState::Preparing => {
+				prepare_queue
+					.send(prepare::ToQueue::Amend {
+						priority,
+						artifact_id: pvf.to_artifact_id(),
+					})
+					.await
+					.map_err(|_| Fatal)?;
+
 				awaiting_prepare
 					.entry(artifact_id)
 					.or_default()
@@ -375,7 +375,8 @@ async fn handle_heads_up(
 						*last_time_needed = now.clone();
 					}
 					ArtifactState::Preparing => {
-						// Already preparing so no need to update the last needed.
+						// Already preparing. We don't need to send a priority amend either because
+						// it can't get any lower than the background.
 					}
 				}
 			}
@@ -495,10 +496,9 @@ fn pulse_every(interval: std::time::Duration) -> impl futures::Stream<Item = ()>
 
 #[cfg(test)]
 mod tests {
-	use std::ops::Sub;
-
-    use futures::future::BoxFuture;
 	use super::*;
+	use futures::future::BoxFuture;
+	use assert_matches::assert_matches;
 
 	#[async_std::test]
 	async fn pulse_test() {
@@ -534,7 +534,7 @@ mod tests {
 	impl Builder {
 		fn default() -> Self {
 			Self {
-				// just to not fire on regular tests.
+				// these are selected high to not interfere in tests in which pruning is irrelevant.
 				cleanup_pulse_interval: Duration::from_secs(3600),
 				artifact_ttl: Duration::from_secs(3600),
 
@@ -614,18 +614,6 @@ mod tests {
 		}
 	}
 
-	#[async_std::test]
-	async fn shutdown_on_handle_drop() {
-		let test = Builder::default().build();
-
-		let join_handle = async_std::task::spawn(test.run);
-
-		// Dropping the handle will lead to conclusion of the read part and thus will make the event
-		// loop to stop, which in turn will resolve the join handle.
-		drop(test.from_handle_tx);
-		join_handle.await;
-	}
-
 	async fn run_until<R>(
 		task: &mut (impl Future<Output = ()> + Unpin),
 		mut fut: (impl Future<Output = R> + Unpin),
@@ -652,8 +640,20 @@ mod tests {
 	}
 
 	#[async_std::test]
+	async fn shutdown_on_handle_drop() {
+		let test = Builder::default().build();
+
+		let join_handle = async_std::task::spawn(test.run);
+
+		// Dropping the handle will lead to conclusion of the read part and thus will make the event
+		// loop to stop, which in turn will resolve the join handle.
+		drop(test.from_handle_tx);
+		join_handle.await;
+	}
+
+	#[async_std::test]
 	async fn pruning() {
-		let mock_now = SystemTime::now().sub(Duration::from_millis(1000));
+		let mock_now = SystemTime::now() - Duration::from_millis(1000);
 
 		let mut builder = Builder::default();
 		builder.cleanup_pulse_interval = Duration::from_millis(100);
@@ -673,7 +673,7 @@ mod tests {
 			},
 		);
 		let mut test = builder.build();
-		let mut host = test.host_handle();
+		let host = test.host_handle();
 
 		host.heads_up(vec![Pvf::from_discriminator(1)])
 			.now_or_never()
@@ -689,5 +689,178 @@ mod tests {
 			.boxed(),
 		)
 		.await;
+	}
+
+	#[async_std::test]
+	async fn amending_priority() {
+		let mut test = Builder::default().build();
+		let host = test.host_handle();
+
+		host.heads_up(vec![Pvf::from_discriminator(1)])
+			.now_or_never()
+			.unwrap()
+			.unwrap();
+
+		// Run until we receive a prepare request.
+		let prepare_q_rx = &mut test.to_prepare_queue_rx;
+		run_until(
+			&mut test.run,
+			async {
+				assert_matches!(prepare_q_rx.next().await.unwrap(), prepare::ToQueue::Enqueue { .. });
+			}
+			.boxed(),
+		)
+		.await;
+
+		let (result_tx, _result_rx) = oneshot::channel();
+		host.execute_pvf(
+			Pvf::from_discriminator(1),
+			vec![],
+			Priority::Critical,
+			result_tx,
+		)
+		.now_or_never()
+		.unwrap()
+		.unwrap();
+
+		run_until(
+			&mut test.run,
+			async {
+				assert_matches!(prepare_q_rx.next().await.unwrap(), prepare::ToQueue::Amend { .. });
+			}
+			.boxed(),
+		)
+		.await;
+	}
+
+	#[async_std::test]
+	async fn execute_pvf_requests() {
+		use polkadot_parachain::wasm_executor::InvalidCandidate;
+
+		let mut test = Builder::default().build();
+		let host = test.host_handle();
+
+		let (result_tx, result_rx_pvf_1_1) = oneshot::channel();
+		host.execute_pvf(
+			Pvf::from_discriminator(1),
+			b"pvf1".to_vec(),
+			Priority::Normal,
+			result_tx,
+		)
+		.await
+		.unwrap();
+
+		let (result_tx, result_rx_pvf_1_2) = oneshot::channel();
+		host.execute_pvf(
+			Pvf::from_discriminator(1),
+			b"pvf1".to_vec(),
+			Priority::Critical,
+			result_tx,
+		)
+		.await
+		.unwrap();
+
+		let (result_tx, result_rx_pvf_2) = oneshot::channel();
+		host.execute_pvf(
+			Pvf::from_discriminator(2),
+			b"pvf1".to_vec(),
+			Priority::Normal,
+			result_tx,
+		)
+		.await
+		.unwrap();
+
+		let prepare_q_rx = &mut test.to_prepare_queue_rx;
+		run_until(
+			&mut test.run,
+			async {
+				assert_matches!(prepare_q_rx.next().await.unwrap(), prepare::ToQueue::Enqueue { .. });
+				assert_matches!(prepare_q_rx.next().await.unwrap(), prepare::ToQueue::Amend { .. });
+				assert_matches!(prepare_q_rx.next().await.unwrap(), prepare::ToQueue::Enqueue { .. });
+			}
+			.boxed(),
+		)
+		.await;
+
+		test.from_prepare_queue_tx
+			.send(prepare::FromQueue::Prepared(artifact_id(1)))
+			.await
+			.unwrap();
+		let execute_q_rx = &mut test.to_execute_queue_rx;
+		let result_tx_pvf_1_1 = run_until(
+			&mut test.run,
+			async {
+				assert_matches!(
+					execute_q_rx.next().await.unwrap(),
+					execute::ToQueue::Enqueue { result_tx, .. } => result_tx
+				)
+			}
+			.boxed(),
+		)
+		.await;
+		let result_tx_pvf_1_2 = run_until(
+			&mut test.run,
+			async {
+				assert_matches!(
+					execute_q_rx.next().await.unwrap(),
+					execute::ToQueue::Enqueue { result_tx, .. } => result_tx
+				)
+			}
+			.boxed(),
+		)
+		.await;
+
+		test.from_prepare_queue_tx
+			.send(prepare::FromQueue::Prepared(artifact_id(2)))
+			.await
+			.unwrap();
+		let execute_q_rx = &mut test.to_execute_queue_rx;
+		let result_tx_pvf_2 = run_until(
+			&mut test.run,
+			async {
+				assert_matches!(
+					execute_q_rx.next().await.unwrap(),
+					execute::ToQueue::Enqueue { result_tx, .. } => result_tx
+				)
+			}
+			.boxed(),
+		)
+		.await;
+
+		result_tx_pvf_1_1
+			.send(Err(ValidationError::InvalidCandidate(
+				InvalidCandidate::BadReturn,
+			)))
+			.unwrap();
+		assert_matches!(
+			result_rx_pvf_1_1.now_or_never().unwrap().unwrap(),
+			Err(ValidationError::InvalidCandidate(
+				InvalidCandidate::BadReturn
+			))
+		);
+
+		result_tx_pvf_1_2
+			.send(Err(ValidationError::InvalidCandidate(
+				InvalidCandidate::BadReturn,
+			)))
+			.unwrap();
+		assert_matches!(
+			result_rx_pvf_1_2.now_or_never().unwrap().unwrap(),
+			Err(ValidationError::InvalidCandidate(
+				InvalidCandidate::BadReturn
+			))
+		);
+
+		result_tx_pvf_2
+			.send(Err(ValidationError::InvalidCandidate(
+				InvalidCandidate::BadReturn,
+			)))
+			.unwrap();
+		assert_matches!(
+			result_rx_pvf_2.now_or_never().unwrap().unwrap(),
+			Err(ValidationError::InvalidCandidate(
+				InvalidCandidate::BadReturn
+			))
+		);
 	}
 }
