@@ -24,6 +24,7 @@ use parity_scale_codec::Encode as _;
 
 mod adder;
 mod worker_common;
+mod torture;
 
 const PUPPET_EXE: &str = env!("CARGO_BIN_EXE_puppet_worker");
 
@@ -84,11 +85,6 @@ async fn terminates_on_timeout() {
 			if msg == "hard timeout" => {}
 		r => panic!("{:?}", r),
 	}
-
-	// TODO: uncomment
-
-	// check that another parachain can validate normaly
-	// adder::execute_good_on_parent_with_external_process_validation();
 }
 
 #[async_std::test]

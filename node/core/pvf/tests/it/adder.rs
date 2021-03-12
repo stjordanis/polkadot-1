@@ -14,6 +14,7 @@
 // You should have received a copy of the GNU General Public License
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
+use super::TestHost;
 use polkadot_parachain::{
 	primitives::{
 		RelayChainBlockNumber, BlockData as GenericBlockData, HeadData as GenericHeadData,
@@ -22,7 +23,6 @@ use polkadot_parachain::{
 };
 use parity_scale_codec::{Decode, Encode};
 use adder::{HeadData, BlockData, hash_state};
-use super::TestHost;
 
 #[async_std::test]
 async fn execute_good_on_parent() {
